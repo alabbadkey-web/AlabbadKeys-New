@@ -8,7 +8,9 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "15"
+APP_VERSION = "16.0.0"
+GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
+UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
 NAVY = "#0f172a"
 SIDEBAR = "#111827"
@@ -955,11 +957,83 @@ class App(tk.Tk):
         p.pack(pady=(4, 16))
 
         ttk.Button(card, text="دخول", style="Accent.TButton", command=lambda: self.auth(u.get().strip(), p.get())).pack(fill="x", ipady=4)
+        ttk.Button(card, text="التحقق من وجود تحديث", command=self.check_for_updates).pack(fill="x", pady=(8, 0))
         if default_password_in_use():
             tk.Label(card, text="أول دخول: admin / ChangeMe123!  (غيّر كلمة المرور فورًا)", bg="white", fg=AMBER, font=(FONT, 9)).pack(pady=(14, 0))
         p.bind("<Return>", lambda e: self.auth(u.get().strip(), p.get()))
         u.bind("<Return>", lambda e: p.focus_set())
         u.focus_set()
+
+    def check_for_updates(self):
+        """يفحص آخر إصدار منشور في GitHub Releases؛ لا يغيّر قاعدة البيانات."""
+        import threading
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                    headers={"User-Agent": "AlabbadKeys-Updater", "Accept": "application/vnd.github+json"},
+                )
+                with urllib.request.urlopen(req, timeout=12) as response:
+                    release = json.loads(response.read().decode("utf-8"))
+                latest = str(release.get("tag_name", "")).strip().lstrip("vV")
+                assets = release.get("assets", [])
+                asset = next((a for a in assets if a.get("name") == UPDATE_ASSET_NAME and a.get("browser_download_url")), None)
+                if not latest or not asset:
+                    self.after(0, lambda: messagebox.showinfo("التحديثات", "لم يتم العثور على إصدار منشور يحتوي على ملف AlabbadKeys_New.exe."))
+                    return
+                def version_tuple(value):
+                    try:
+                        return tuple(int(x) for x in value.split(".")[:3])
+                    except Exception:
+                        return (0,)
+                if version_tuple(latest) <= version_tuple(APP_VERSION):
+                    self.after(0, lambda: messagebox.showinfo("التحديثات", f"أنت تستخدم أحدث إصدار ({APP_VERSION})."))
+                    return
+                def ask_download():
+                    if not messagebox.askyesno("تحديث جديد", f"يتوفر الإصدار {latest}.\nهل تريد تنزيله وتثبيته الآن؟\nسيتم الاحتفاظ بقاعدة البيانات ومجلد الصور."):
+                        return
+                    threading.Thread(target=self._download_and_install_update, args=(asset["browser_download_url"], latest), daemon=True).start()
+                self.after(0, ask_download)
+            except Exception as e:
+                msg = str(e)
+                self.after(0, lambda msg=msg: messagebox.showerror("تعذر التحقق من التحديث", "تعذر الاتصال بخادم التحديثات. تحقق من الإنترنت وأن الإصدار منشور في GitHub Releases.\n\n" + msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_and_install_update(self, url, version):
+        """ينزّل EXE إلى مجلد مؤقت ثم يشغّل ملف BAT لاستبدال التطبيق بعد إغلاقه."""
+        try:
+            if not getattr(sys, "frozen", False):
+                self.after(0, lambda: messagebox.showinfo("التحديث", "التحديث التلقائي يعمل في نسخة EXE فقط."))
+                return
+            current_exe = os.path.abspath(sys.executable)
+            app_dir = os.path.dirname(current_exe)
+            temp_dir = tempfile.mkdtemp(prefix="alabbad_update_")
+            new_exe = os.path.join(temp_dir, UPDATE_ASSET_NAME)
+            req = urllib.request.Request(url, headers={"User-Agent": "AlabbadKeys-Updater"})
+            with urllib.request.urlopen(req, timeout=60) as response, open(new_exe, "wb") as out:
+                shutil.copyfileobj(response, out)
+            if os.path.getsize(new_exe) < 1_000_000:
+                raise RuntimeError("حجم ملف التحديث غير متوقع؛ لم يتم تثبيته.")
+            bat_path = os.path.join(temp_dir, "install_update.bat")
+            # قاعدة البيانات والصور لا تُلمس؛ يستبدل ملف EXE فقط.
+            bat = "@echo off\r\n" \
+                "set OLD=%~1\r\nset NEW=%~2\r\n" \
+                "for /L %%i in (1,1,30) do (\r\n" \
+                "  tasklist /FI \"IMAGENAME eq %~nx1\" 2>NUL | find /I \"%~nx1\" >NUL\r\n" \
+                "  if errorlevel 1 goto replace\r\n  timeout /t 1 /nobreak >NUL\r\n)\r\n" \
+                ":replace\r\ncopy /Y \"%NEW%\" \"%OLD%\" >NUL\r\n" \
+                "if errorlevel 1 (echo Update failed. & pause & exit /b 1)\r\n" \
+                "start \"\" \"%OLD%\"\r\n" \
+                "del \"%NEW%\" >NUL 2>&1\r\n" \
+                "del \"%~f0\" >NUL 2>&1\r\n"
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat)
+            import subprocess
+            subprocess.Popen(["cmd.exe", "/c", "start", "", bat_path, current_exe, new_exe], cwd=app_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.after(0, self.destroy)
+        except Exception as e:
+            msg = str(e)
+            self.after(0, lambda msg=msg: messagebox.showerror("فشل التحديث", "لم يتم تثبيت التحديث. النسخة الحالية وبياناتك لم تُحذف.\n\n" + msg))
 
     def auth(self, u, p):
         with connect() as c:
