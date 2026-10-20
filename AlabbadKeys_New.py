@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import re, sqlite3, os, sys, hashlib, secrets, hmac, shutil, tempfile, webbrowser, html, json, threading, zipfile
+import subprocess
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.1.0"
+APP_VERSION = "16.0.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -122,6 +123,114 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ------------------------------------------------------------------ التحديث من GitHub Releases
+def version_tuple(v):
+    """'v16.0.1' -> (16, 0, 1)"""
+    nums = [int(x) for x in re.findall(r"\d+", str(v or ""))[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def is_newer(latest, current):
+    return version_tuple(latest) > version_tuple(current)
+
+
+def fetch_latest_release(repo=None, api="https://api.github.com", timeout=15):
+    """يرجع بيانات آخر إصدار منشور، أو None إذا لا يوجد إصدار منشور بعد."""
+    repo = repo or GITHUB_REPO
+    req = urllib.request.Request(f"{api}/repos/{repo}/releases/latest",
+                                 headers={"User-Agent": "AlabbadKeys-Updater", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rel = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    tag = str(rel.get("tag_name", "")).strip()
+    asset = next((a for a in rel.get("assets", []) if a.get("name") == UPDATE_ASSET_NAME and a.get("browser_download_url")), None)
+    digest = str((asset or {}).get("digest") or "")
+    return {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "url": (asset or {}).get("browser_download_url", ""),
+        "has_asset": asset is not None,
+        "sha256": digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else "",
+        "notes": str(rel.get("body") or "").strip(),
+        "page": rel.get("html_url") or f"https://github.com/{repo}/releases/latest",
+    }
+
+
+def download_update(url, sha256="", progress=None):
+    """ينزّل ملف EXE الجديد إلى مجلد مؤقت ويتحقق منه، ويرجع مساره."""
+    temp_dir = tempfile.mkdtemp(prefix="alabbad_update_")
+    new_exe = os.path.join(temp_dir, UPDATE_ASSET_NAME)
+    req = urllib.request.Request(url, headers={"User-Agent": "AlabbadKeys-Updater"})
+    h = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=60) as r, open(new_exe, "wb") as out:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+            h.update(chunk)
+    if os.path.getsize(new_exe) < 1_000_000:
+        raise RuntimeError("حجم ملف التحديث غير متوقع؛ لم يتم تثبيته.")
+    if sha256 and h.hexdigest().lower() != sha256:
+        raise RuntimeError("فشل التحقق من سلامة الملف المنزّل؛ لم يتم تثبيته.")
+    return new_exe
+
+
+def update_bat_text():
+    """سكربت يستبدل ملف EXE بعد إغلاق البرنامج (قاعدة البيانات والصور لا تُلمس)."""
+    lines = [
+        "@echo off",
+        "set OLD=%~1",
+        "set NEW=%~2",
+        "set /a W=0",
+        ":wait",
+        'tasklist /FI "IMAGENAME eq %~nx1" 2>NUL | find /I "%~nx1" >NUL',
+        "if errorlevel 1 goto copy",
+        "set /a W+=1",
+        "if %W% GEQ 40 goto copy",
+        "timeout /t 1 /nobreak >NUL",
+        "goto wait",
+        ":copy",
+        "set /a T=0",
+        ":again",
+        'copy /Y "%NEW%" "%OLD%" >NUL 2>&1',
+        "if not errorlevel 1 goto ok",
+        "set /a T+=1",
+        "if %T% GEQ 15 goto fail",
+        "timeout /t 1 /nobreak >NUL",
+        "goto again",
+        ":ok",
+        'start "" "%OLD%"',
+        'del "%NEW%" >NUL 2>&1',
+        'del "%~f0" >NUL 2>&1',
+        "exit /b 0",
+        ":fail",
+        "echo Update failed. The old version and your data are untouched.",
+        "pause",
+        "exit /b 1",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def launch_update_installer(new_exe):
+    """يشغّل سكربت الاستبدال ثم على البرنامج أن يُغلق نفسه."""
+    current_exe = os.path.abspath(sys.executable)
+    bat_path = os.path.join(os.path.dirname(new_exe), "install_update.bat")
+    with open(bat_path, "w", encoding="utf-8", newline="") as f:
+        f.write(update_bat_text())
+    # مهم: نسخة EXE الجديدة يجب أن تفك نفسها من جديد، فلا نورّثها متغيرات PyInstaller الخاصة بالنسخة الحالية
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("_PYI") or k == "_MEIPASS2")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(["cmd.exe", "/c", "start", "", bat_path, current_exe, new_exe],
+                     cwd=os.path.dirname(current_exe), env=env,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+
 # ------------------------------------------------------------------ صور المنتجات
 IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_item_images_new")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
@@ -178,7 +287,7 @@ def init():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY,salt TEXT,hash TEXT,role TEXT,perms TEXT);
         CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT);
-        CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,part TEXT,car TEXT,y1 TEXT,y2 TEXT,kind TEXT,qty INTEGER,buy REAL,expense REAL,profit REAL,retail REAL,location TEXT,notes TEXT,item_no TEXT,condition TEXT DEFAULT 'NEW', origin_type TEXT DEFAULT 'غير محدد');
+        CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,part TEXT,car TEXT,y1 TEXT,y2 TEXT,kind TEXT,qty INTEGER,buy REAL,expense REAL,profit REAL,retail REAL,location TEXT,notes TEXT,item_no TEXT,condition TEXT DEFAULT 'NEW');
         CREATE TABLE IF NOT EXISTS suppliers(id INTEGER PRIMARY KEY,name TEXT UNIQUE,phone TEXT,notes TEXT);
         CREATE TABLE IF NOT EXISTS item_types(id INTEGER PRIMARY KEY,name TEXT UNIQUE);
         CREATE TABLE IF NOT EXISTS car_makes(id INTEGER PRIMARY KEY,name TEXT UNIQUE COLLATE NOCASE);
@@ -268,10 +377,6 @@ def init():
 
         if "condition" not in item_cols:
             c.execute("ALTER TABLE items ADD COLUMN condition TEXT DEFAULT 'NEW'")
-
-        # تصنيف الصنف: أصلي أو تجاري. الأصناف القديمة تبقى غير محددة حتى لا نفترض تصنيفها.
-        if "origin_type" not in item_cols:
-            c.execute("ALTER TABLE items ADD COLUMN origin_type TEXT DEFAULT 'غير محدد'")
 
         if "make" not in item_cols:
             c.execute("ALTER TABLE items ADD COLUMN make TEXT DEFAULT ''")
@@ -424,6 +529,76 @@ def add_row(t, values, iid=None, extra=()):
 def clear_tree(t):
     for i in t.get_children():
         t.delete(i)
+
+
+# ------------------------------------------------------------------ إطار يتمدد مع الشاشة وله سكرول
+_SCROLLERS = set()
+
+
+def make_scrollable(parent, bg=BG, ttk_inner=True, pad=0, bar=True):
+    """إطار يتمدد على قدر النافذة، وإذا كان المحتوى أطول من الشاشة يظهر سكرول (فلا يختفي أي زر)."""
+    outer = tk.Frame(parent, bg=bg)
+    canvas = tk.Canvas(outer, bg=bg, highlightthickness=0, bd=0, yscrollincrement=30)
+    inner = ttk.Frame(canvas, padding=pad) if ttk_inner else tk.Frame(canvas, bg=bg)
+    wid = canvas.create_window((0, 0), window=inner, anchor="nw")
+    if bar:
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="left", fill="y")
+    canvas.pack(side="right", fill="both", expand=True)
+    last = [None]
+
+    def fit(_e=None):
+        try:
+            w, h = canvas.winfo_width(), canvas.winfo_height()
+            hh = max(h, inner.winfo_reqheight())
+            if last[0] != (w, hh):
+                last[0] = (w, hh)
+                canvas.itemconfigure(wid, width=w, height=hh)
+                canvas.configure(scrollregion=(0, 0, w, hh))
+        except tk.TclError:
+            return False
+        return True
+
+    def poll():
+        if fit():
+            try:
+                canvas.after(250, poll)
+            except tk.TclError:
+                pass
+
+    canvas.bind("<Configure>", fit)
+    canvas.after(50, poll)
+    _SCROLLERS.add(canvas)
+    canvas.bind("<Destroy>", lambda e: _SCROLLERS.discard(canvas))
+    return outer, inner, canvas
+
+
+def _on_wheel(root, e):
+    """عجلة الماوس تحرّك الصفحة (إلا فوق الجداول والقوائم فهي تتحرك بنفسها)."""
+    try:
+        w = root.winfo_containing(e.x_root, e.y_root)
+    except Exception:
+        w = None
+    if w is None or isinstance(w, (ttk.Treeview, tk.Listbox, tk.Text)):
+        return
+    cur = w
+    while cur is not None:
+        if cur in _SCROLLERS:
+            try:
+                if cur.yview() != (0.0, 1.0):
+                    num_ = getattr(e, "num", None)
+                    if num_ == 4:
+                        d = -1
+                    elif num_ == 5:
+                        d = 1
+                    else:
+                        d = -1 if e.delta > 0 else 1
+                    cur.yview_scroll(d * 2, "units")
+            except tk.TclError:
+                pass
+            return
+        cur = getattr(cur, "master", None)
 
 
 # ------------------------------------------------------------------ الباركود
@@ -832,6 +1007,8 @@ class App(tk.Tk):
         self.perms = set()
         self.nav_buttons = {}
         self.setup_style()
+        for _ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(_ev, lambda e: _on_wheel(self, e))
         self.login()
 
     # ------------------------------------------------------------------ المظهر
@@ -860,7 +1037,7 @@ class App(tk.Tk):
         s.configure("TCombobox", padding=5, fieldbackground="white", arrowsize=14)
         s.configure("TLabelframe", background=BG, bordercolor=BORDER)
         s.configure("TLabelframe.Label", background=BG, foreground=NAVY, font=(FONT, 10, "bold"))
-        s.configure("Treeview", rowheight=30, font=(FONT, 10), background="white", fieldbackground="white", foreground=TEXT, bordercolor=BORDER)
+        s.configure("Treeview", rowheight=(30 if self.winfo_screenheight() >= 900 else 24), font=(FONT, 10), background="white", fieldbackground="white", foreground=TEXT, bordercolor=BORDER)
         s.configure("Treeview.Heading", background=NAVY, foreground="white", font=(FONT, 10, "bold"), padding=8, relief="flat")
         s.map("Treeview.Heading", background=[("active", "#1e293b")])
         s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "white")])
@@ -897,6 +1074,12 @@ class App(tk.Tk):
         self.center(win, w, h)
 
     def scroll_area(self, parent):
+        """إطار قابل للتمرير (سكرول) داخل النافذة."""
+        outer, inner, _canvas = make_scrollable(parent, BG, True, pad=14)
+        outer.pack(fill="both", expand=True)
+        return inner
+
+    def _old_scroll_area(self, parent):
         """إطار قابل للتمرير (سكرول) داخل النافذة."""
         outer = ttk.Frame(parent)
         outer.pack(fill="both", expand=True)
@@ -968,76 +1151,94 @@ class App(tk.Tk):
         u.bind("<Return>", lambda e: p.focus_set())
         u.focus_set()
 
-    def check_for_updates(self):
-        """يفحص آخر إصدار منشور في GitHub Releases؛ لا يغيّر قاعدة البيانات."""
-        import threading
-        def worker():
-            try:
-                req = urllib.request.Request(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                    headers={"User-Agent": "AlabbadKeys-Updater", "Accept": "application/vnd.github+json"},
-                )
-                with urllib.request.urlopen(req, timeout=12) as response:
-                    release = json.loads(response.read().decode("utf-8"))
-                latest = str(release.get("tag_name", "")).strip().lstrip("vV")
-                assets = release.get("assets", [])
-                asset = next((a for a in assets if a.get("name") == UPDATE_ASSET_NAME and a.get("browser_download_url")), None)
-                if not latest or not asset:
-                    self.after(0, lambda: messagebox.showinfo("التحديثات", "لم يتم العثور على إصدار منشور يحتوي على ملف AlabbadKeys_New.exe."))
-                    return
-                def version_tuple(value):
-                    try:
-                        return tuple(int(x) for x in value.split(".")[:3])
-                    except Exception:
-                        return (0,)
-                if version_tuple(latest) <= version_tuple(APP_VERSION):
-                    self.after(0, lambda: messagebox.showinfo("التحديثات", f"أنت تستخدم أحدث إصدار ({APP_VERSION})."))
-                    return
-                def ask_download():
-                    if not messagebox.askyesno("تحديث جديد", f"يتوفر الإصدار {latest}.\nهل تريد تنزيله وتثبيته الآن؟\nسيتم الاحتفاظ بقاعدة البيانات ومجلد الصور."):
-                        return
-                    threading.Thread(target=self._download_and_install_update, args=(asset["browser_download_url"], latest), daemon=True).start()
-                self.after(0, ask_download)
-            except Exception as e:
-                msg = str(e)
-                self.after(0, lambda msg=msg: messagebox.showerror("تعذر التحقق من التحديث", "تعذر الاتصال بخادم التحديثات. تحقق من الإنترنت وأن الإصدار منشور في GitHub Releases.\n\n" + msg))
-        threading.Thread(target=worker, daemon=True).start()
+    def _run_bg(self, work, done):
+        """يشغّل عملًا طويلًا في خيط خلفي ويستدعي done(نتيجة، خطأ) داخل خيط الواجهة (آمن)."""
+        box = {}
 
-    def _download_and_install_update(self, url, version):
-        """ينزّل EXE إلى مجلد مؤقت ثم يشغّل ملف BAT لاستبدال التطبيق بعد إغلاقه."""
-        try:
-            if not getattr(sys, "frozen", False):
-                self.after(0, lambda: messagebox.showinfo("التحديث", "التحديث التلقائي يعمل في نسخة EXE فقط."))
+        def runner():
+            try:
+                box["ok"] = work()
+            except Exception as e:
+                box["err"] = e
+            finally:
+                box["done"] = True
+
+        threading.Thread(target=runner, daemon=True).start()
+
+        def poll():
+            if not box.get("done"):
+                try:
+                    self.after(150, poll)
+                except tk.TclError:
+                    pass
                 return
-            current_exe = os.path.abspath(sys.executable)
-            app_dir = os.path.dirname(current_exe)
-            temp_dir = tempfile.mkdtemp(prefix="alabbad_update_")
-            new_exe = os.path.join(temp_dir, UPDATE_ASSET_NAME)
-            req = urllib.request.Request(url, headers={"User-Agent": "AlabbadKeys-Updater"})
-            with urllib.request.urlopen(req, timeout=60) as response, open(new_exe, "wb") as out:
-                shutil.copyfileobj(response, out)
-            if os.path.getsize(new_exe) < 1_000_000:
-                raise RuntimeError("حجم ملف التحديث غير متوقع؛ لم يتم تثبيته.")
-            bat_path = os.path.join(temp_dir, "install_update.bat")
-            # قاعدة البيانات والصور لا تُلمس؛ يستبدل ملف EXE فقط.
-            bat = "@echo off\r\n" \
-                "set OLD=%~1\r\nset NEW=%~2\r\n" \
-                "for /L %%i in (1,1,30) do (\r\n" \
-                "  tasklist /FI \"IMAGENAME eq %~nx1\" 2>NUL | find /I \"%~nx1\" >NUL\r\n" \
-                "  if errorlevel 1 goto replace\r\n  timeout /t 1 /nobreak >NUL\r\n)\r\n" \
-                ":replace\r\ncopy /Y \"%NEW%\" \"%OLD%\" >NUL\r\n" \
-                "if errorlevel 1 (echo Update failed. & pause & exit /b 1)\r\n" \
-                "start \"\" \"%OLD%\"\r\n" \
-                "del \"%NEW%\" >NUL 2>&1\r\n" \
-                "del \"%~f0\" >NUL 2>&1\r\n"
-            with open(bat_path, "w", encoding="utf-8") as f:
-                f.write(bat)
-            import subprocess
-            subprocess.Popen(["cmd.exe", "/c", "start", "", bat_path, current_exe, new_exe], cwd=app_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.after(0, self.destroy)
-        except Exception as e:
-            msg = str(e)
-            self.after(0, lambda msg=msg: messagebox.showerror("فشل التحديث", "لم يتم تثبيت التحديث. النسخة الحالية وبياناتك لم تُحذف.\n\n" + msg))
+            done(box.get("ok"), box.get("err"))
+
+        self.after(150, poll)
+
+    def check_for_updates(self):
+        """يبحث عن إصدار أحدث في GitHub Releases. لا يغيّر قاعدة البيانات ولا الصور."""
+        if getattr(self, "_update_busy", False):
+            return
+        self._update_busy = True
+        self.config(cursor="watch")
+
+        def finish(rel, err):
+            self._update_busy = False
+            self.config(cursor="")
+            if err is not None:
+                if isinstance(err, urllib.error.HTTPError) and err.code in (403, 429):
+                    msg = "GitHub رفض الطلب مؤقتًا (كثرة المحاولات). جرّب بعد قليل."
+                else:
+                    msg = "تعذر الاتصال بخادم التحديثات. تحقق من الإنترنت.\n\n" + str(err)
+                messagebox.showerror("تعذر التحقق من التحديث", msg)
+                return
+            if not rel or not rel["tag"]:
+                messagebox.showinfo("التحديثات", "لا يوجد إصدار منشور في GitHub حتى الآن.")
+                return
+            if not is_newer(rel["version"], APP_VERSION):
+                messagebox.showinfo("التحديثات", f"أنت تستخدم أحدث إصدار ({APP_VERSION}).")
+                return
+            if not rel["has_asset"]:
+                messagebox.showwarning("التحديثات", f"يوجد إصدار أحدث ({rel['version']}) لكن ملف {UPDATE_ASSET_NAME} غير مرفق به.")
+                return
+            notes = rel["notes"][:400]
+            body = f"يتوفر إصدار جديد: {rel['version']}\nالإصدار الحالي: {APP_VERSION}\n"
+            if notes:
+                body += "\nما الجديد:\n" + notes + "\n"
+            if not getattr(sys, "frozen", False):
+                if messagebox.askyesno("تحديث جديد", body + "\nالتحديث التلقائي يعمل في نسخة EXE فقط.\nهل تفتح صفحة التنزيل؟"):
+                    webbrowser.open(rel["page"])
+                return
+            if messagebox.askyesno("تحديث جديد", body + "\nهل تريد تنزيله وتثبيته الآن؟\nسيُغلق البرنامج ويُعاد فتحه، وتبقى قاعدة البيانات والصور كما هي."):
+                self._install_update(rel)
+
+        self._run_bg(fetch_latest_release, finish)
+
+    def _install_update(self, rel):
+        wait = tk.Toplevel(self)
+        wait.title("تحديث")
+        wait.configure(bg=BG)
+        wait.transient(self)
+        ttk.Label(wait, text="جاري تنزيل التحديث... لا تغلق البرنامج", padding=24).pack()
+        self.center(wait, 360, 90)
+
+        def finish(new_exe, err):
+            try:
+                wait.destroy()
+            except tk.TclError:
+                pass
+            if err is not None:
+                messagebox.showerror("فشل التحديث", "لم يتم تثبيت التحديث. النسخة الحالية وبياناتك لم تُحذف.\n\n" + str(err))
+                return
+            try:
+                launch_update_installer(new_exe)
+            except Exception as e:
+                messagebox.showerror("فشل التحديث", "تعذر بدء التثبيت. النسخة الحالية وبياناتك لم تُحذف.\n\n" + str(e))
+                return
+            self.destroy()
+
+        self._run_bg(lambda: download_update(rel["url"], rel["sha256"]), finish)
 
     def auth(self, u, p):
         with connect() as c:
@@ -1070,14 +1271,20 @@ class App(tk.Tk):
             tk.Button(header, text="👥  إضافة موظف / الصلاحيات", command=self.users_page, bg=ACCENT, fg="white",
                       activebackground=ACCENT_D, activeforeground="white", relief="flat", bd=0, font=(FONT, 10, "bold"),
                       padx=14, pady=6, cursor="hand2").pack(side="left", padx=6)
+            tk.Button(header, text="🔄  التحقق من تحديث", command=self.check_for_updates, bg="#0f766e", fg="white",
+                      activebackground="#115e59", activeforeground="white", relief="flat", bd=0, font=(FONT, 10, "bold"),
+                      padx=14, pady=6, cursor="hand2").pack(side="left", padx=6)
+            tk.Button(header, text="📄  Google Sheets", command=self.sync_from_settings, bg="#475569", fg="white",
+                      activebackground="#334155", activeforeground="white", relief="flat", bd=0, font=(FONT, 10, "bold"),
+                      padx=14, pady=6, cursor="hand2").pack(side="left", padx=6)
 
         main = tk.Frame(self, bg=BG)
         main.pack(fill="both", expand=True)
         side = tk.Frame(main, bg=SIDEBAR, width=225)
         side.pack(side="right", fill="y")
         side.pack_propagate(False)
-        self.body = ttk.Frame(main, padding=20)
-        self.body.pack(side="left", fill="both", expand=True)
+        body_wrap, self.body, self.body_canvas = make_scrollable(main, BG, True, pad=20)
+        body_wrap.pack(side="left", fill="both", expand=True)
 
         def foot_btn(text, cmd):
             b = tk.Button(side, text=text, command=cmd, anchor="e", bg=SIDEBAR, fg="#94a3b8", activebackground="#1f2937",
@@ -1109,11 +1316,13 @@ class App(tk.Tk):
             if getattr(self, "active_nav", None) != key:
                 btn.configure(bg="#1f2937" if entering else SIDEBAR)
 
-        tk.Frame(side, bg=SIDEBAR, height=10).pack()
+        navwrap, navinner, _nc = make_scrollable(side, SIDEBAR, False, bar=False)
+        navwrap.pack(fill="both", expand=True)
+        tk.Frame(navinner, bg=SIDEBAR, height=6).pack()
         for key, label, fn, allowed in nav:
             if not allowed:
                 continue
-            b = tk.Button(side, text=label, command=fn, anchor="e", bg=SIDEBAR, fg="#cbd5e1", activebackground=ACCENT,
+            b = tk.Button(navinner, text=label, command=fn, anchor="e", bg=SIDEBAR, fg="#cbd5e1", activebackground=ACCENT,
                           activeforeground="white", relief="flat", bd=0, font=(FONT, 11), padx=18, pady=6, cursor="hand2")
             b.pack(fill="x")
             b.bind("<Enter>", lambda e, b=b, k=key: hover(b, k, True))
@@ -1164,6 +1373,10 @@ class App(tk.Tk):
                     pass
 
     def clear(self, nav=None):
+        try:
+            self.body_canvas.yview_moveto(0)
+        except Exception:
+            pass
         for w in self.body.winfo_children():
             w.destroy()
         if nav:
@@ -1781,9 +1994,6 @@ class App(tk.Tk):
         cond = ttk.Combobox(frame, values=["جديد", "مستعمل"], state="readonly", justify="right")
         cond.set("مستعمل" if str(val("condition", "NEW")).upper() == "USED" else "جديد")
         line("الحالة", cond)
-        origin_type = ttk.Combobox(frame, values=["أصلي", "تجاري", "غير محدد"], state="readonly", justify="right")
-        origin_type.set(val("origin_type", "غير محدد") or "غير محدد")
-        line("تصنيف القطعة", origin_type)
         notes = entry(val("notes"))
         line("ملاحظات", notes)
 
@@ -1803,7 +2013,6 @@ class App(tk.Tk):
                 "retail": retail.get().strip(),
                 "location": location.get().strip(),
                 "condition": "USED" if cond.get() == "مستعمل" else "NEW",
-                "origin_type": origin_type.get().strip() or "غير محدد",
                 "notes": notes.get().strip(),
             }
             new_id = None
@@ -1863,12 +2072,12 @@ class App(tk.Tk):
                 raise ValueError(f"رقم القطعة موجود مسبقًا بنفس الحالة. رقم الصنف: {duplicate['item_no']}")
             image_name = store_image(d.get("image_src"))
             cur = c.execute("""
-                INSERT INTO items(item_no,part,car,make,model,y1,y2,category,kind,supplier,rep_name,rep_code,qty,buy,expense,profit,retail,location,condition,origin_type,notes,incomplete,image)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO items(item_no,part,car,make,model,y1,y2,category,kind,supplier,rep_name,rep_code,qty,buy,expense,profit,retail,location,condition,notes,incomplete,image)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 item_no, d["part"].strip(), car, d["make"], d["model"], d["y1"], d["y2"],
                 d["category"], d["kind"], d.get("supplier", ""), d.get("rep_name", ""), d.get("rep_code", ""), qty, buy, expense,
-                profit, num(d["retail"]), d["location"], state, d.get("origin_type", "غير محدد"), d["notes"], incomplete, image_name
+                profit, num(d["retail"]), d["location"], state, d["notes"], incomplete, image_name
             ))
             return cur.lastrowid
 
@@ -1913,17 +2122,17 @@ class App(tk.Tk):
                 raise ValueError("رقم القطعة موجود مسبقًا لصنف بنفس الحالة")
             base = (item_no, d["part"].strip(), car, make, model, d["y1"], d["y2"], d["category"], d["kind"],
                     d.get("rep_name", ""), d.get("rep_code", ""),
-                    qty, num(d["retail"]), d["location"], state, d.get("origin_type", "غير محدد"), d["notes"])
+                    qty, num(d["retail"]), d["location"], state, d["notes"])
             if self.can("view_cost"):
                 buy = num(d["buy"])
                 c.execute("""
-                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,origin_type=?,notes=?,
+                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,notes=?,
                     buy=?,expense=?,profit=?,incomplete=?
                     WHERE id=?
                 """, base + (buy, round(buy * num(d["expense"]) / 100.0, 4), num(d["profit"]), 0 if buy > 0 else 1, item_id))
             else:
                 c.execute("""
-                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,origin_type=?,notes=?
+                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,notes=?
                     WHERE id=?
                 """, base + (item_id,))
             old_img = c.execute("SELECT image FROM items WHERE id=?", (item_id,)).fetchone()["image"]
@@ -3662,6 +3871,7 @@ class App(tk.Tk):
         ttk.Button(box, text="🔑  تغيير كلمة المرور", command=self.change_pw).pack(fill="x", pady=5)
         ttk.Button(box, text="💾  نسخة احتياطية", command=self.backup).pack(fill="x", pady=5)
         ttk.Button(box, text="📄  إعداد Google Sheets", command=self.sync_from_settings).pack(fill="x", pady=5)
+        ttk.Button(box, text="🔄  التحقق من وجود تحديث", style="Accent.TButton", command=self.check_for_updates).pack(fill="x", pady=5)
         ttk.Button(box, text="📞  مسؤول المشتريات (واتساب النواقص)", command=self.purchasing_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="👤  جوال المدير لاستلام طلبات الموظفين", command=self.manager_phone_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="🗂  نسخة كاملة (قاعدة البيانات + الصور)", command=self.backup_full).pack(fill="x", pady=5)
