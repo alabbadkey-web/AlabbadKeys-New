@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.1.1"
+APP_VERSION = "16.1.2"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -425,6 +425,10 @@ def init():
 
         if "rep_code" not in item_cols:
             c.execute("ALTER TABLE items ADD COLUMN rep_code TEXT DEFAULT ''")
+
+        # الأصل: أصلي / صيني
+        if "origin" not in item_cols:
+            c.execute("ALTER TABLE items ADD COLUMN origin TEXT DEFAULT ''")
 
         # رمز المورد (يظهر في الباركود ليدل على مصدر القطعة)
         scols = {r[1] for r in c.execute("PRAGMA table_info(suppliers)").fetchall()}
@@ -1669,7 +1673,7 @@ class App(tk.Tk):
         cols = []
         if show_cost:
             cols.append("alert")
-        cols += ["item_no", "photo", "part", "car", "years", "category", "qty", "location", "condition", "kind"]
+        cols += ["item_no", "photo", "part", "car", "years", "category", "qty", "location", "condition", "kind", "origin"]
         if show_cost:
             cols.append("cost")
         if show_ws:
@@ -1679,10 +1683,10 @@ class App(tk.Tk):
             cols.append("retail_low")
         if show_sup:
             cols += ["supplier", "rep_code"]
-        heads = {"photo": "صورة", "rep": "المورد", "rep_code": "رمز عند المورد", "id": "معرّف", "alert": "تنبيه", "item_no": "رقم الصنف / الباركود", "condition": "الحالة", "part": "رقم القطعة", "car": "السيارة", "years": "السنوات",
+        heads = {"origin": "الأصل", "photo": "صورة", "rep": "المورد", "rep_code": "رمز عند المورد", "id": "معرّف", "alert": "تنبيه", "item_no": "رقم الصنف / الباركود", "condition": "الحالة", "part": "رقم القطعة", "car": "السيارة", "years": "السنوات",
                  "category": "نوع القطعة", "kind": "نوع المفتاح", "qty": "الكمية", "cost": "التكلفة الحقيقية", "wholesale_min": "سعر الجملة", "retail": "سعر المفرد",
                  "retail_low": "أقل بيع مفرد سابق", "supplier": "المورد", "location": "الموقع"}
-        widths = {"alert": 125, "item_no": 120, "part": 120, "car": 140, "years": 90, "category": 100, "qty": 70, "location": 110, "condition": 75, "kind": 100, "cost": 110, "wholesale_min": 100, "retail": 100, "retail_low": 120, "supplier": 110, "photo": 55, "rep": 110, "rep_code": 130}
+        widths = {"origin": 70, "alert": 125, "item_no": 120, "part": 120, "car": 140, "years": 90, "category": 100, "qty": 70, "location": 110, "condition": 75, "kind": 100, "cost": 110, "wholesale_min": 100, "retail": 100, "retail_low": 120, "supplier": 110, "photo": 55, "rep": 110, "rep_code": 130}
         t = make_tree(self.body, cols, heads, widths)
         count_var = tk.StringVar(value="")
         ttk.Label(self.body, textvariable=count_var, style="Muted.TLabel").pack(anchor="e")
@@ -1719,14 +1723,15 @@ class App(tk.Tk):
                     OR COALESCE(i.car,'') LIKE ?
                     OR COALESCE(i.kind,'') LIKE ?
                     OR COALESCE(i.notes,'') LIKE ?
-                    OR COALESCE(i.rep_code,'') LIKE ?)
+                    OR COALESCE(i.rep_code,'') LIKE ?
+                    OR COALESCE(i.origin,'') LIKE ?)
                     AND (?='الكل' OR COALESCE(i.category,'غير محدد')=?)
                     AND (?='الكل' OR COALESCE(i.supplier,'')=? OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=i.id AND p.supplier=?))
                     AND COALESCE(i.car,'') LIKE ?
                     AND (?='' OR COALESCE(i.y1,'') LIKE ? OR COALESCE(i.y2,'') LIKE ?)
                     AND (?=0 OR COALESCE(i.incomplete,0)=1)
                     ORDER BY i.id DESC
-                """, (query, query, query, query, query, query, cat.get(), cat.get(), sup.get(), sup.get(), sup.get(), cq, y, "%" + y + "%", "%" + y + "%", inc_var.get())).fetchall()
+                """, (query, query, query, query, query, query, query, cat.get(), cat.get(), sup.get(), sup.get(), sup.get(), cq, y, "%" + y + "%", "%" + y + "%", inc_var.get())).fetchall()
 
             clear_tree(t)
             shown = 0
@@ -1747,6 +1752,8 @@ class App(tk.Tk):
                         values.append("مستعمل" if str(r["condition"] or "NEW").upper() == "USED" else "جديد")
                     elif col == "category":
                         values.append(r["category"] or "غير محدد")
+                    elif col == "origin":
+                        values.append(r["origin"] or "")
                     elif col == "alert":
                         values.append("⚠ معلومات ناقصة" if r["incomplete"] else "")
                     elif col in ("cost", "wholesale_min", "retail", "retail_low"):
@@ -1949,6 +1956,11 @@ class App(tk.Tk):
         kind = entry(val("kind"))
         line("نوع المفتاح", kind)
 
+        origin_cb = ttk.Combobox(frame, values=["أصلي", "صيني"], state="readonly", justify="right")
+        if val("origin"):
+            origin_cb.set(val("origin"))
+        line("الأصل (أصلي / صيني)", origin_cb)
+
         rep_code = entry(val("rep_code"))
         line("رمز المنتج عند المورد (رقم أو اسم في نظامه)", rep_code)
 
@@ -2032,6 +2044,7 @@ class App(tk.Tk):
                 "y1": y1.get().strip(), "y2": y2.get().strip(),
                 "category": cat_cb.get().strip(), "kind": kind.get().strip(),
                 "rep_code": rep_code.get().strip(),
+                "origin": origin_cb.get().strip(),
                 "image_src": img["src"], "image_remove": img["remove"],
                 "qty": qty.get().strip(),
                 "buy": buy.get().strip() if buy else "0",
@@ -2042,6 +2055,9 @@ class App(tk.Tk):
                 "condition": "USED" if cond.get() == "مستعمل" else "NEW",
                 "notes": notes.get().strip(),
             }
+            if not editing and not d["origin"]:
+                messagebox.showerror("خطأ", "اختر الأصل: أصلي أو صيني", parent=win)
+                return
             new_id = None
             try:
                 if editing:
@@ -2106,6 +2122,7 @@ class App(tk.Tk):
                 d["category"], d["kind"], d.get("supplier", ""), d.get("rep_name", ""), d.get("rep_code", ""), qty, buy, expense,
                 profit, num(d["retail"]), d["location"], state, d["notes"], incomplete, image_name
             ))
+            c.execute("UPDATE items SET origin=? WHERE id=?", (d.get("origin", ""), cur.lastrowid))
             return cur.lastrowid
 
     def edit_item(self, table):
@@ -2162,6 +2179,7 @@ class App(tk.Tk):
                     UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,notes=?
                     WHERE id=?
                 """, base + (item_id,))
+            c.execute("UPDATE items SET origin=? WHERE id=?", (d.get("origin", ""), item_id))
             old_img = c.execute("SELECT image FROM items WHERE id=?", (item_id,)).fetchone()["image"]
             if d.get("image_src"):
                 c.execute("UPDATE items SET image=? WHERE id=?", (store_image(d["image_src"]), item_id))
@@ -2440,11 +2458,11 @@ class App(tk.Tk):
         item_frame = ttk.LabelFrame(self.body, text="إضافة الأصناف", padding=8)
         item_frame.pack(fill="x", pady=5)
         with connect() as c:
-            items = c.execute("SELECT id,item_no,part,car,qty,retail,buy,expense,profit,condition FROM items WHERE qty>0 ORDER BY item_no").fetchall()
+            items = c.execute("SELECT id,item_no,part,car,qty,retail,buy,expense,profit,condition,origin FROM items WHERE qty>0 ORDER BY item_no").fetchall()
         item_map = {}
         options = []
         for r in items:
-            label = f"{r['item_no']} | {r['part']} | {r['car']} | {'مستعمل' if r['condition'] == 'USED' else 'جديد'} | المتوفر {r['qty']}"
+            label = f"{r['item_no']} | {r['part']} | {r['car']} | {'مستعمل' if r['condition'] == 'USED' else 'جديد'}{(' | ' + r['origin']) if r['origin'] else ''} | المتوفر {r['qty']}"
             options.append(label)
             item_map[label] = r
         ttk.Label(item_frame, text="الصنف").grid(row=0, column=5, padx=4)
