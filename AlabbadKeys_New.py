@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.2.0"
+APP_VERSION = "16.3.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -443,6 +443,10 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS bundles(id INTEGER PRIMARY KEY,code TEXT UNIQUE,name TEXT NOT NULL,retail REAL DEFAULT 0,active INTEGER DEFAULT 1)")
         c.execute("CREATE TABLE IF NOT EXISTS bundle_items(id INTEGER PRIMARY KEY,bundle_id INTEGER NOT NULL,item_id INTEGER NOT NULL,qty INTEGER NOT NULL DEFAULT 1)")
 
+        # رموز بديلة للصنف (تبقى بعد دمج صنفين مكررين حتى لا يتكرر الصنف في الفواتير القادمة)
+        c.execute("CREATE TABLE IF NOT EXISTS item_aliases(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,supplier TEXT DEFAULT '',code TEXT NOT NULL,UNIQUE(item_id,code))")
+        c.execute("CREATE TABLE IF NOT EXISTS dup_ignored(a_id INTEGER,b_id INTEGER,PRIMARY KEY(a_id,b_id))")
+
         # رمز المورد (يظهر في الباركود ليدل على مصدر القطعة)
         scols = {r[1] for r in c.execute("PRAGMA table_info(suppliers)").fetchall()}
         if "code" not in scols:
@@ -830,6 +834,289 @@ def customer_suggestions(c, text, limit=8):
     """, ("%" + t + "%", like_phone, like_phone, limit)).fetchall()
 
 
+# ------------------------------------------------------------------ كشف الأصناف المكررة (بين الموردين)
+def norm_code(s):
+    """يوحّد الرمز: حروف كبيرة وبدون رموز/فراغات (TY-123 = ty 123)."""
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+
+def image_dhash(path):
+    """بصمة بصرية للصورة (dHash 64 بت): الصور المتشابهة تعطي بصمات متقاربة."""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L").resize((9, 8))
+        px = list(im.getdata())
+        bits = 0
+        for r_ in range(8):
+            for c_ in range(8):
+                bits = (bits << 1) | (1 if px[r_ * 9 + c_] > px[r_ * 9 + c_ + 1] else 0)
+        return bits
+    except Exception:
+        return None
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+_HASH_CACHE = {}
+
+
+def item_image_hash(name):
+    if not name:
+        return None
+    path = image_path(name)
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    if key not in _HASH_CACHE:
+        _HASH_CACHE[key] = image_dhash(path)
+    return _HASH_CACHE[key]
+
+
+def _kind_key(s):
+    m = re.search(r"\d(?:\+\d)?", str(s or ""))
+    return m.group(0) if m else re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _year_range(y1, y2):
+    def one(v):
+        m = re.search(r"(?:19|20)\d{2}", str(v or ""))
+        return int(m.group(0)) if m else None
+    a, b = one(y1), one(y2)
+    if a is None and b is None:
+        return None
+    a = a if a is not None else b
+    b = b if b is not None else a
+    return (min(a, b), max(a, b))
+
+
+def similarity(a, b):
+    """يقارن صنفين (قاموسين) ويرجع (نسبة التشابه 0-100، أسباب). الأصلي والصيني أو الجديد والمستعمل ليسا مكررين."""
+    ca = {norm_code(x) for x in [a.get("part"), a.get("rep_code"), *(a.get("codes") or [])]} - {""}
+    cb = {norm_code(x) for x in [b.get("part"), b.get("rep_code"), *(b.get("codes") or [])]} - {""}
+    if ca & cb:
+        return 100, ["نفس رمز المنتج"]
+    s, why = 0, []
+    if a.get("make") and a.get("make") == b.get("make"):
+        s += 10
+        if a.get("model") and a.get("model") == b.get("model"):
+            s += 20
+            why.append("نفس السيارة والموديل")
+    if a.get("category") and a.get("category") == b.get("category"):
+        s += 20
+        why.append("نفس نوع القطعة")
+    ka, kb = _kind_key(a.get("kind")), _kind_key(b.get("kind"))
+    if ka and kb:
+        if ka == kb:
+            s += 20
+            why.append("نفس نوع المفتاح")
+        else:
+            s -= 15
+    ya, yb = _year_range(a.get("y1"), a.get("y2")), _year_range(b.get("y1"), b.get("y2"))
+    if ya and yb:
+        if ya[0] <= yb[1] and yb[0] <= ya[1]:
+            s += 15
+            why.append("سنوات متقاطعة")
+        else:
+            s -= 25
+    ha, hb = a.get("img_hash"), b.get("img_hash")
+    if ha is not None and hb is not None:
+        d = hamming(ha, hb)
+        if d <= 6:
+            s += 35
+            why.append("صورة متطابقة تقريبًا")
+        elif d <= 12:
+            s += 20
+            why.append("صورة مشابهة")
+    oa, ob = a.get("origin") or "", b.get("origin") or ""
+    if oa and ob and oa != ob:
+        s *= 0.4
+        why.append(f"الأصل مختلف ({oa} / {ob})")
+    if (a.get("condition") or "NEW").upper() != (b.get("condition") or "NEW").upper():
+        s *= 0.4
+        why.append("الحالة مختلفة")
+    return max(0, min(99, int(round(s)))), why
+
+
+def _item_profile(r, codes):
+    return {"part": r["part"], "rep_code": r["rep_code"], "category": r["category"], "make": r["make"], "model": r["model"],
+            "y1": r["y1"], "y2": r["y2"], "kind": r["kind"], "origin": r["origin"], "condition": r["condition"],
+            "codes": codes, "img_hash": item_image_hash(r["image"])}
+
+
+def _extra_codes(c, ids):
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for tbl in ("item_supplier_codes", "item_aliases"):
+            for r in c.execute(f"SELECT item_id, code FROM {tbl} WHERE item_id IN ({marks})", part).fetchall():
+                out.setdefault(r["item_id"], set()).add(r["code"])
+    return out
+
+
+def _item_brief(r):
+    return {"id": r["id"], "item_no": r["item_no"], "name": item_display_name(r), "qty": r["qty"] or 0, "origin": r["origin"] or ""}
+
+
+def find_similar_items(c, cand, exclude_id=None, limit=5, threshold=65):
+    """أصناف موجودة قد تكون هي نفس الصنف الجديد (cand: قاموس بنفس مفاتيح similarity)."""
+    codes = {x for x in (norm_code(cand.get("part")), norm_code(cand.get("rep_code"))) if x}
+    pool = set()
+    if cand.get("make") and cand.get("model"):
+        pool.update(r[0] for r in c.execute("SELECT id FROM items WHERE COALESCE(make,'')=? AND COALESCE(model,'')=? LIMIT 600",
+                                            (cand["make"], cand["model"])).fetchall())
+    elif cand.get("category"):
+        pool.update(r[0] for r in c.execute("SELECT id FROM items WHERE COALESCE(category,'')=? LIMIT 600", (cand["category"],)).fetchall())
+    if codes:
+        for r in c.execute("SELECT id,part,rep_code FROM items").fetchall():
+            if {norm_code(r["part"]), norm_code(r["rep_code"])} & codes:
+                pool.add(r["id"])
+        for r in c.execute("SELECT item_id, code FROM item_supplier_codes UNION ALL SELECT item_id, code FROM item_aliases").fetchall():
+            if norm_code(r["code"]) in codes:
+                pool.add(r["item_id"])
+    pool.discard(exclude_id)
+    if not pool:
+        return []
+    ids = list(pool)
+    extra = _extra_codes(c, ids)
+    out = []
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        for r in c.execute(f"SELECT * FROM items WHERE id IN ({','.join('?' * len(part))})", part).fetchall():
+            sc, why = similarity(cand, _item_profile(r, extra.get(r["id"], set())))
+            if sc >= threshold:
+                out.append(dict(_item_brief(r), score=sc, reasons=why))
+    out.sort(key=lambda x: -x["score"])
+    return out[:limit]
+
+
+def find_duplicate_pairs(c, threshold=65, limit=300):
+    """يفحص كل المخزون ويرجع أزواج الأصناف المشتبه بتكرارها (بدون الأزواج التي حدّدت أنها مختلفة)."""
+    rows = c.execute("SELECT * FROM items").fetchall()
+    by_id = {r["id"]: r for r in rows}
+    extra = _extra_codes(c, by_id.keys())
+    ignored = {(r[0], r[1]) for r in c.execute("SELECT a_id,b_id FROM dup_ignored").fetchall()}
+    profiles = {i: _item_profile(r, extra.get(i, set())) for i, r in by_id.items()}
+    pairs = {}
+
+    def add(i, j):
+        a, b = (i, j) if i < j else (j, i)
+        if a == b or (a, b) in pairs or (a, b) in ignored:
+            return
+        sc, why = similarity(profiles[a], profiles[b])
+        if sc >= threshold:
+            pairs[(a, b)] = (sc, why)
+
+    blocks = {}
+    for i, r in by_id.items():
+        key = (r["make"], r["model"]) if (r["make"] and r["model"]) else ("", r["category"] or "")
+        blocks.setdefault(key, []).append(i)
+    for ids in blocks.values():
+        for x in range(len(ids)):
+            for y in range(x + 1, len(ids)):
+                add(ids[x], ids[y])
+    by_code = {}
+    for i, p in profiles.items():
+        for cd in {norm_code(x) for x in [p["part"], p["rep_code"], *p["codes"]]} - {""}:
+            by_code.setdefault(cd, set()).add(i)
+    for ids in by_code.values():
+        ids = sorted(ids)
+        for x in range(len(ids)):
+            for y in range(x + 1, len(ids)):
+                add(ids[x], ids[y])
+    out = [{"a": _item_brief(by_id[a]), "b": _item_brief(by_id[b]), "score": sc, "reasons": why} for (a, b), (sc, why) in pairs.items()]
+    out.sort(key=lambda p: -p["score"])
+    return out[:limit]
+
+
+def merge_items(c, keep_id, drop_id):
+    """يدمج صنفًا مكررًا (drop) في الصنف المُبقى (keep): الكمية تُجمع والتكلفة بالمتوسط المرجّح،
+    وكل المشتريات والمبيعات والطلبات تنتقل، ورموز الصنف المحذوف تبقى رموزًا بديلة."""
+    if keep_id == drop_id:
+        raise ValueError("اختر صنفين مختلفين")
+    keep = c.execute("SELECT * FROM items WHERE id=?", (keep_id,)).fetchone()
+    drop = c.execute("SELECT * FROM items WHERE id=?", (drop_id,)).fetchone()
+    if not keep or not drop:
+        raise ValueError("أحد الصنفين غير موجود")
+    q1, q2 = max(int(keep["qty"] or 0), 0), max(int(drop["qty"] or 0), 0)
+    b1, e1, b2, e2 = num(keep["buy"]), num(keep["expense"]), num(drop["buy"]), num(drop["expense"])
+    if (b1 + e1) > 0 and (b2 + e2) > 0 and q1 + q2 > 0:
+        nb, ne = (q1 * b1 + q2 * b2) / (q1 + q2), (q1 * e1 + q2 * e2) / (q1 + q2)
+        profit = num(keep["profit"])
+    elif (b1 + e1) > 0:
+        nb, ne, profit = b1, e1, num(keep["profit"])
+    else:
+        nb, ne, profit = b2, e2, num(drop["profit"])
+    retail = num(keep["retail"]) if num(keep["retail"]) > 0 else num(drop["retail"])
+    image = keep["image"] or drop["image"]
+    min_qty = keep["min_qty"] if keep["min_qty"] is not None else drop["min_qty"]
+    c.execute("""UPDATE items SET qty=?, buy=?, expense=?, profit=?, retail=?, image=?, min_qty=?,
+                 supplier=COALESCE(NULLIF(supplier,''),?), rep_code=COALESCE(NULLIF(rep_code,''),?), incomplete=? WHERE id=?""",
+              (q1 + q2, round(nb, 4), round(ne, 4), profit, retail, image or "", min_qty,
+               drop["supplier"] or "", drop["rep_code"] or "", 0 if (nb + ne) > 0 else 1, keep_id))
+    for tbl in ("purchases", "sales", "po_lines", "bundle_items"):
+        c.execute(f"UPDATE {tbl} SET item_id=? WHERE item_id=?", (keep_id, drop_id))
+    aliases = [("", cd) for cd in (drop["part"], drop["rep_code"], drop["item_no"]) if cd]
+    for tbl in ("item_supplier_codes", "item_aliases"):
+        aliases += [(r["supplier"] or "", r["code"]) for r in c.execute(f"SELECT supplier, code FROM {tbl} WHERE item_id=?", (drop_id,)).fetchall()]
+    for sup, cd in aliases:
+        c.execute("INSERT OR IGNORE INTO item_aliases(item_id,supplier,code) VALUES(?,?,?)", (keep_id, sup, cd))
+    for r in c.execute("SELECT supplier, code FROM item_supplier_codes WHERE item_id=?", (drop_id,)).fetchall():
+        c.execute("INSERT OR IGNORE INTO item_supplier_codes(item_id,supplier,code) VALUES(?,?,?)", (keep_id, r["supplier"], r["code"]))
+    for tbl in ("item_supplier_codes", "item_aliases"):
+        c.execute(f"DELETE FROM {tbl} WHERE item_id=?", (drop_id,))
+    c.execute("DELETE FROM stock_alerts WHERE item_id=?", (drop_id,))
+    c.execute("DELETE FROM dup_ignored WHERE a_id=? OR b_id=?", (drop_id, drop_id))
+    c.execute("DELETE FROM items WHERE id=?", (drop_id,))
+    return {"qty": q1 + q2, "delete_image": drop["image"] if (drop["image"] and drop["image"] != image) else ""}
+
+
+# ------------------------------------------------------------------ صور الأصناف داخل فاتورة PDF
+def extract_pdf_row_images(path, lines, out_dir=None):
+    """يقصّ صورة كل صنف من الفاتورة (الصورة الواقعة بجانب سطر الصنف) ويرجع {رقم السطر في القائمة: مسار PNG}."""
+    out_dir = out_dir or tempfile.mkdtemp(prefix="alabbad_pdfimg_")
+    result, renders = {}, {}
+    try:
+        import pdfplumber
+    except Exception:
+        return result
+    with pdfplumber.open(path) as pdf:
+        for idx, ln in enumerate(lines):
+            pi = ln.get("page")
+            if pi is None or pi >= len(pdf.pages) or ln.get("lo") is None:
+                continue
+            page = pdf.pages[pi]
+            best = None
+            for im in page.images:
+                x0, x1, top, bottom = im["x0"], im["x1"], im["top"], im["bottom"]
+                w, h = x1 - x0, bottom - top
+                cy = (top + bottom) / 2.0
+                if w < 15 or h < 15 or top < ln["hdr"] - 2:
+                    continue  # شعار أو زخرفة أعلى الجدول
+                if ln["lo"] <= cy < ln["hi"] and (best is None or w * h > best[0]):
+                    best = (w * h, (max(x0, 0), max(top, 0), min(x1, page.width), min(bottom, page.height)))
+            if not best:
+                continue
+            try:
+                s = 200 / 72.0
+                if pi not in renders:  # نرسم كل صفحة مرة واحدة ثم نقصّ منها (أسرع بكثير)
+                    renders[pi] = page.to_image(resolution=200).original.convert("RGB")
+                bx0, btop, bx1, bbot = best[1]
+                ox, oy = page.bbox[0], page.bbox[1]
+                pic = renders[pi].crop((int((bx0 - ox) * s), int((btop - oy) * s), int((bx1 - ox) * s), int((bbot - oy) * s)))
+                pic.thumbnail((700, 700))
+                p = os.path.join(out_dir, f"line_{idx}.png")
+                pic.save(p)
+                result[idx] = p
+            except Exception:
+                continue
+    return result
+
+
 # ------------------------------------------------------------------ قراءة فواتير الموردين من PDF
 _NUM_RE = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
 _DATE_RE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
@@ -1061,7 +1348,8 @@ def parse_supplier_invoice(pages):
                 continue
             if total is None:
                 total = round(qty * price, 2)
-            res["lines"].append({"n": n, "code": code, "desc": desc, "qty": qty, "price": price, "total": total})
+            res["lines"].append({"n": n, "code": code, "desc": desc, "qty": qty, "price": price, "total": total,
+                                 "page": pi, "lo": lo, "hi": hi, "hdr": hdr})
         last_page, last_row_cy = pi, centers[-1]
 
     # ---- المجاميع (شحن / خصم / ضريبة / الصافي) بعد آخر سطر في الجدول
@@ -1832,6 +2120,8 @@ class App(tk.Tk):
             ttk.Button(row, text="＋ إضافة صنف", style="Accent.TButton", command=self.add_item).pack(side="left")
         if self.can("inv_edit"):
             ttk.Button(row, text="تعديل الصنف المحدد", command=lambda: self.edit_item(t)).pack(side="left", padx=4)
+        if self.role == "admin" or self.can("inv_edit"):
+            ttk.Button(row, text="🧬 فحص المكرر", command=self.duplicates_window).pack(side="left", padx=4)
         if self.can("shortage"):
             ttk.Button(row, text="🔔 حد التنبيه للمحدد", command=lambda: self.set_min_qty(t)).pack(side="left", padx=4)
         if self.can("barcode"):
@@ -2110,7 +2400,7 @@ class App(tk.Tk):
         rep_code = entry(val("rep_code"))
         line("رمز المنتج عند المورد (رقم أو اسم في نظامه)", rep_code)
 
-        img = {"src": None, "remove": False, "current": val("image")}
+        img = {"src": (val("image_src") or None), "remove": False, "current": val("image")}
         img_box = ttk.Frame(frame)
         img_lbl = ttk.Label(img_box, text="لا توجد صورة", style="Muted.TLabel")
         img_lbl.pack(side="right", padx=6)
@@ -2205,6 +2495,13 @@ class App(tk.Tk):
             if not editing and not d["origin"]:
                 messagebox.showerror("خطأ", "اختر الأصل: أصلي أو صيني", parent=win)
                 return
+            if not editing and not val("_skip_dup"):
+                cand = {k: d[k] for k in ("part", "rep_code", "make", "model", "category", "kind", "y1", "y2", "origin", "condition")}
+                cand["img_hash"] = image_dhash(img["src"]) if img["src"] else None
+                with connect() as c_:
+                    sims = find_similar_items(c_, cand)
+                if sims and self._similar_dialog(win, sims, f"{d['part']} — {d['make']} {d['model']}", mode="add") is None:
+                    return
             new_id = None
             try:
                 if editing:
@@ -2472,7 +2769,10 @@ class App(tk.Tk):
                 return r["item_id"]
         r = c.execute("SELECT id FROM items WHERE UPPER(COALESCE(rep_code,''))=? OR UPPER(COALESCE(part,''))=? OR UPPER(COALESCE(item_no,''))=? ORDER BY id LIMIT 1",
                       (code, code, code)).fetchone()
-        return r["id"] if r else None
+        if r:
+            return r["id"]
+        r = c.execute("SELECT item_id FROM item_aliases WHERE UPPER(code)=? ORDER BY (supplier=?) DESC LIMIT 1", (code, supplier or "")).fetchone()
+        return r["item_id"] if r else None
 
     # --------------------------------------------------------------- المبيعات
     def sales(self):
@@ -2725,13 +3025,16 @@ class App(tk.Tk):
         def scan(_e=None):
             bm = parse_barcode(scan_e.get())
             code = bm[0] if bm else scan_e.get().strip().upper()
-            for label, r_ in item_map.items():
-                if (r_["item_no"] or "").upper() == code:
-                    item_sel.set(label)
-                    select_item()
-                    scan_e.delete(0, "end")
-                    qty.focus_set()
-                    return
+            with connect() as c_:
+                al_ = c_.execute("SELECT i.item_no FROM item_aliases a JOIN items i ON i.id=a.item_id WHERE UPPER(a.code)=? LIMIT 1", (code,)).fetchone()
+            for want in [code] + ([(al_["item_no"] or "").upper()] if al_ else []):
+                for label, r_ in item_map.items():
+                    if (r_["item_no"] or "").upper() == want:
+                        item_sel.set(label)
+                        select_item()
+                        scan_e.delete(0, "end")
+                        qty.focus_set()
+                        return
             messagebox.showwarning("تنبيه", "الباركود غير موجود، أو الصنف نافد من المخزون")
 
         scan_e.bind("<Return>", scan)
@@ -5185,10 +5488,165 @@ class App(tk.Tk):
             messagebox.showwarning("ملاحظات على القراءة", "\n".join(parsed["warnings"]))
         self._import_review(parsed, path, on_done)
 
+    # ------------------------------------------------------------- المشابهات والمكرر
+    def _similar_for_line(self, c, ln):
+        g = guess_item_fields(ln["code"], ln["desc"])
+        cand = {"part": ln["code"], "rep_code": ln["code"], "category": g["category"], "make": g["make"], "model": g["model"],
+                "y1": g["y1"], "y2": g["y2"], "kind": g["kind"], "condition": g["condition"], "origin": "",
+                "img_hash": image_dhash(ln["img"]) if ln.get("img") else None}
+        return find_similar_items(c, cand)
+
+    def _similar_dialog(self, parent, sims, subject, mode="import"):
+        """يعرض الأصناف المشابهة. يرجع ("link", رقم) أو ("new", None) أو None عند الإلغاء."""
+        result = {"v": None}
+        dlg = tk.Toplevel(parent)
+        dlg.title("⚠ أصناف مشابهة")
+        dlg.configure(bg=BG)
+        dlg.transient(parent)
+        dlg.grab_set()
+        fr = ttk.Frame(dlg, padding=14)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(fr, text="قد يكون هذا الصنف مكررًا", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(fr, text=subject, style="Sub.TLabel", wraplength=800, justify="right").pack(anchor="e", pady=(0, 6))
+        t = make_tree(fr, ("score", "item_no", "name", "qty", "why"),
+                      {"score": "التشابه", "item_no": "رقم الصنف", "name": "الصنف", "qty": "المتوفر", "why": "السبب"},
+                      {"name": 300, "why": 280, "score": 80}, height=min(max(len(sims), 2), 6))
+        for i, s in enumerate(sims):
+            add_row(t, (f"{s['score']}%", s["item_no"], s["name"] + (f" ({s['origin']})" if s["origin"] else ""), s["qty"], "، ".join(s["reasons"])),
+                    iid=str(s["id"]), extra=("best",) if i == 0 else ())
+        if sims:
+            t.selection_set(str(sims[0]["id"]))
+
+        def link():
+            sel = t.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد الصنف الذي تريد الربط به", parent=dlg)
+                return
+            result["v"] = ("link", int(sel[0]))
+            dlg.destroy()
+
+        def new():
+            result["v"] = ("new", None)
+            dlg.destroy()
+
+        btns = ttk.Frame(fr)
+        btns.pack(fill="x", pady=(10, 0))
+        if mode == "import":
+            ttk.Button(btns, text="🔗 هو نفس الصنف — اربطه بالمحدد", style="Success.TButton", command=link).pack(side="right", padx=4)
+            ttk.Button(btns, text="صنف مختلف — أنشئ صنفًا جديدًا", command=new).pack(side="right", padx=4)
+        else:
+            ttk.Button(btns, text="صنف مختلف — احفظه كصنف جديد", style="Accent.TButton", command=new).pack(side="right", padx=4)
+        ttk.Button(btns, text="إلغاء", command=dlg.destroy).pack(side="left", padx=4)
+        self.autosize(dlg, fr, 880)
+        dlg.wait_window()
+        return result["v"]
+
+    def _apply_import_images(self, active_lines, replace):
+        """يضع صور الفاتورة كصورة للصنف (للأصناف بدون صورة فقط، أو يستبدل الموجود)."""
+        with connect() as c:
+            for ln in active_lines:
+                if not ln.get("img") or not ln.get("item_id") or not os.path.exists(ln["img"]):
+                    continue
+                cur = c.execute("SELECT image FROM items WHERE id=?", (ln["item_id"],)).fetchone()
+                if not cur or (cur["image"] and not replace):
+                    continue
+                c.execute("UPDATE items SET image=? WHERE id=?", (store_image(ln["img"]), ln["item_id"]))
+                if cur["image"]:
+                    delete_image(cur["image"])
+
+    def duplicates_window(self):
+        if not (self.role == "admin" or self.can("inv_edit")):
+            return
+        win = tk.Toplevel(self)
+        win.title("🧬 فحص الأصناف المكررة")
+        win.configure(bg=BG)
+        self.center(win, 1200, 680)
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(side="bottom", fill="x")
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="الأصناف المشتبه بتكرارها", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(body, text="يقارن البرنامج السيارة والموديل ونوع القطعة ونوع المفتاح والسنوات والصور والرموز. الأصلي والصيني، والجديد والمستعمل لا يُعتبران مكررين.",
+                  style="Sub.TLabel", wraplength=1100, justify="right").pack(anchor="e")
+        count_var = tk.StringVar(value="")
+        ttk.Label(body, textvariable=count_var, style="Muted.TLabel").pack(anchor="e")
+        t = make_tree(body, ("score", "a", "b", "why"), {"score": "التشابه", "a": "الصنف الأول", "b": "الصنف الثاني", "why": "السبب"},
+                      {"score": 80, "a": 350, "b": 350, "why": 280})
+        pairs = []
+
+        def label(r):
+            return f"{r['item_no']} | {r['name']}" + (f" ({r['origin']})" if r["origin"] else "") + f" | متوفر {r['qty']}"
+
+        def load():
+            pairs.clear()
+            clear_tree(t)
+            self.config(cursor="watch")
+            win.update_idletasks()
+            try:
+                with connect() as c:
+                    found = find_duplicate_pairs(c)
+            finally:
+                self.config(cursor="")
+            for i, p in enumerate(found):
+                pairs.append(p)
+                add_row(t, (f"{p['score']}%", label(p["a"]), label(p["b"]), "، ".join(p["reasons"])), iid=str(i),
+                        extra=("best",) if p["score"] >= 90 else ())
+            count_var.set(f"عدد الأزواج المشتبه بها: {len(found)}" if found else "لم أجد أصنافًا مكررة ✔")
+
+        def current():
+            sel = t.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد زوجًا من القائمة أولًا", parent=win)
+                return None
+            return pairs[int(sel[0])]
+
+        def merge(keep_first):
+            p = current()
+            if not p:
+                return
+            keep, drop = (p["a"], p["b"]) if keep_first else (p["b"], p["a"])
+            if not messagebox.askyesno("تأكيد الدمج",
+                                       f"سيتم دمج:\n   {label(drop)}\nداخل:\n   {label(keep)}\n\n"
+                                       f"الكمية بعد الدمج: {keep['qty'] + drop['qty']}\n"
+                                       "كل مشتريات ومبيعات الصنف المحذوف تنتقل للصنف المُبقى، ورموزه وباركوده القديم تبقى تعمل.\n"
+                                       "لا يمكن التراجع (تُحفظ نسخة احتياطية تلقائيًا). متابعة؟", parent=win):
+                return
+            try:
+                bdir = os.path.join(os.path.dirname(DB), "merge_backups")
+                os.makedirs(bdir, exist_ok=True)
+                shutil.copy2(DB, os.path.join(bdir, "قبل_الدمج_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".db"))
+                with connect() as c:
+                    res = merge_items(c, keep["id"], drop["id"])
+                if res.get("delete_image"):
+                    delete_image(res["delete_image"])
+            except Exception as e:
+                messagebox.showerror("خطأ", str(e), parent=win)
+                return
+            load()
+
+        def ignore():
+            p = current()
+            if not p:
+                return
+            a, b = sorted((p["a"]["id"], p["b"]["id"]))
+            with connect() as c:
+                c.execute("INSERT OR IGNORE INTO dup_ignored(a_id,b_id) VALUES(?,?)", (a, b))
+            load()
+
+        ttk.Button(bar, text="دمج: أبقِ الأول واحذف الثاني", style="Success.TButton", command=lambda: merge(True)).pack(side="right", padx=4)
+        ttk.Button(bar, text="دمج: أبقِ الثاني واحذف الأول", style="Success.TButton", command=lambda: merge(False)).pack(side="right", padx=4)
+        ttk.Button(bar, text="ليسا مكررين (تجاهل)", command=ignore).pack(side="right", padx=4)
+        ttk.Button(bar, text="🔄 إعادة الفحص", command=load).pack(side="left", padx=4)
+        load()
+
     def _import_review(self, parsed, path, on_done=None):
         with connect() as c:
             sups = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()]
-        lines = [dict(l, item_id=None, skip=False, manual=False) for l in parsed["lines"]]
+        try:
+            row_imgs = extract_pdf_row_images(path, parsed["lines"])
+        except Exception:
+            row_imgs = {}
+        lines = [dict(l, item_id=None, skip=False, manual=False, img=row_imgs.get(i), similar=[]) for i, l in enumerate(parsed["lines"])]
         CUR = {"SAR": "ريال سعودي (SAR)", "AED": "درهم إماراتي (AED)", "USD": "دولار أمريكي (USD)"}
 
         win = tk.Toplevel(self)
@@ -5239,6 +5697,14 @@ class App(tk.Tk):
         disc_e = ttk.Entry(r2, width=9, justify="center")
         disc_e.insert(0, f"{parsed['discount']:g}")
         disc_e.pack(side="right", padx=4)
+        n_imgs = sum(1 for ln in lines if ln.get("img"))
+        IMG_MODES = ["للأصناف بدون صورة فقط", "استبدال صور الأصناف", "لا تستورد الصور"]
+        r3 = ttk.Frame(head)
+        r3.pack(fill="x", pady=3)
+        ttk.Label(r3, text=f"صور الفاتورة ({n_imgs} صورة مقروءة)").pack(side="right", padx=4)
+        img_mode = ttk.Combobox(r3, values=IMG_MODES, state="readonly", width=26)
+        img_mode.set(IMG_MODES[0] if n_imgs else IMG_MODES[2])
+        img_mode.pack(side="right", padx=4)
         info_var = tk.StringVar(value="")
         ttk.Label(head, textvariable=info_var, style="Muted.TLabel").pack(anchor="e")
 
@@ -5282,11 +5748,12 @@ class App(tk.Tk):
                     elif ln["item_id"]:
                         st = "✅ " + item_label(c, ln["item_id"])
                     else:
-                        st = "⚠ غير موجود — أنشئه أو اربطه"
+                        sim_ = ln.get("similar") or []
+                        st = "⚠ غير موجود — أنشئه أو اربطه" + (f"  |  🔍 مشابه محتمل: {sim_[0]['item_no']} ({sim_[0]['score']}%)" if sim_ else "")
                         tag = ("low",)
                         unresolved += 1
                     q = ln["qty"]
-                    add_row(t, (ln["n"], ln["code"], ln["desc"][:80], int(q) if float(q).is_integer() else q, f"{ln['price']:,.2f}", sar(unit_sar), st), iid=str(i), extra=tag)
+                    add_row(t, (ln["n"], ln["code"], ("📷 " if ln.get("img") else "") + ln["desc"][:80], int(q) if float(q).is_integer() else q, f"{ln['price']:,.2f}", sar(unit_sar), st), iid=str(i), extra=tag)
             cc = cur_code()
             info_var.set(f"المصاريف الموزعة على الأصناف (شحن + ضريبة − خصم): {extra:,.2f} = {f * 100:.2f}% من قيمة الأصناف — تُضاف لتكلفة كل صنف")
             net = sub + extra
@@ -5302,6 +5769,7 @@ class App(tk.Tk):
                     if ln["manual"] or ln["skip"]:
                         continue
                     ln["item_id"] = self._match_supplier_line(c, sup, ln["code"])
+                    ln["similar"] = [] if ln["item_id"] else self._similar_for_line(c, ln)
             refresh()
 
         def on_cur(*_):
@@ -5335,6 +5803,21 @@ class App(tk.Tk):
 
         def create_for(idx, after=None):
             ln = lines[idx]
+            if not ln.get("_dup_asked"):
+                with connect() as c_:
+                    sims_ = self._similar_for_line(c_, ln)
+                ln["similar"] = sims_
+                if sims_:
+                    ln["_dup_asked"] = True
+                    res_ = self._similar_dialog(win, sims_, f"{ln['code']} — {ln['desc'][:60]}", mode="import")
+                    if res_ is None:
+                        return
+                    if res_[0] == "link":
+                        ln["item_id"], ln["manual"], ln["skip"] = res_[1], True, False
+                        refresh()
+                        if after:
+                            after()
+                        return
             g = guess_item_fields(ln["code"], ln["desc"])
             f, _, _ = factor()
             rate = num(rate_e.get()) or 1.0
@@ -5345,7 +5828,8 @@ class App(tk.Tk):
             prefill = {"part": ln["code"], "category": g["category"] if g["category"] in types else "",
                        "make": g["make"] if g["make"] in makes else "", "model": g["model"] if g["model"] in models else "",
                        "y1": g["y1"], "y2": g["y2"], "kind": g["kind"], "condition": g["condition"], "qty": 0,
-                       "buy": round(ln["price"] * rate, 2), "expense_pct": round(f * 100, 2), "rep_code": ln["code"], "notes": ln["desc"][:150]}
+                       "buy": round(ln["price"] * rate, 2), "expense_pct": round(f * 100, 2), "rep_code": ln["code"], "notes": ln["desc"][:150],
+                       "image_src": (ln.get("img") if img_mode.get() != IMG_MODES[2] else ""), "_skip_dup": True}
 
             def saved(item_id):
                 ln["item_id"] = item_id
@@ -5380,6 +5864,20 @@ class App(tk.Tk):
                 lines[idx]["item_id"] = item_id
                 lines[idx]["manual"] = True
                 lines[idx]["skip"] = False
+                refresh()
+
+        def similar_sel():
+            idx = selected_idx()
+            if idx is None:
+                return
+            with connect() as c_:
+                sims_ = self._similar_for_line(c_, lines[idx])
+            if not sims_:
+                messagebox.showinfo("المشابهات", "ما وجدت أصنافًا مشابهة لهذا السطر.", parent=win)
+                return
+            res_ = self._similar_dialog(win, sims_, f"{lines[idx]['code']} — {lines[idx]['desc'][:60]}", mode="import")
+            if res_ and res_[0] == "link":
+                lines[idx]["item_id"], lines[idx]["manual"], lines[idx]["skip"] = res_[1], True, False
                 refresh()
 
         def skip_sel():
@@ -5419,6 +5917,11 @@ class App(tk.Tk):
                 return
             if cur_code() != "SAR":
                 setsetting(f"rate_{cur_code()}", rate)
+            if img_mode.get() != IMG_MODES[2]:
+                try:
+                    self._apply_import_images(active, img_mode.get() == IMG_MODES[1])
+                except Exception as e:
+                    messagebox.showwarning("الصور", f"تم حفظ الفاتورة لكن تعذّر حفظ بعض الصور:\n{e}", parent=win)
             msg = f"تم تسجيل فاتورة الشراء {inv} ({n} صنف) بحالة معلّقة.\nعند استلام البضاعة حدد الفاتورة واضغط (إضافة الفاتورة المحددة للمخزون)."
             if receive_now:
                 with connect() as c:
@@ -5435,6 +5938,7 @@ class App(tk.Tk):
         ttk.Button(acts, text="＋ إنشاء صنف جديد للسطر المحدد", style="Accent.TButton", command=create_sel).pack(side="right", padx=4)
         ttk.Button(acts, text="⏩ إنشاء كل الأصناف الناقصة بالتتابع", command=create_all).pack(side="right", padx=4)
         ttk.Button(acts, text="🔗 ربط بصنف موجود", command=link_sel).pack(side="right", padx=4)
+        ttk.Button(acts, text="🔍 المشابهات", command=lambda: similar_sel()).pack(side="right", padx=4)
         ttk.Button(acts, text="⏭ تجاهل / إلغاء التجاهل", command=skip_sel).pack(side="right", padx=4)
         ttk.Button(acts, text="↺ إعادة المطابقة", command=rematch).pack(side="left", padx=4)
         ttk.Button(bar, text="✔  تسجيل وإضافة للمخزون الآن", style="Success.TButton", command=lambda: do_save(True)).pack(side="right", padx=8, ipadx=20, ipady=4)
