@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.3.2"
+APP_VERSION = "16.3.3"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -730,6 +730,7 @@ def low_stock_rows(c):
     return c.execute("""
         SELECT * FROM items
         WHERE min_qty IS NOT NULL AND COALESCE(qty,0) <= min_qty
+        AND NOT EXISTS (SELECT 1 FROM purchases p WHERE p.item_id=items.id AND p.status='pending')
         ORDER BY COALESCE(NULLIF(supplier,''),'~'), item_no
     """).fetchall()
 
@@ -4559,15 +4560,41 @@ class App(tk.Tk):
         try:
             with connect() as c:
                 low, new = stock_alert_state(c, self.user)
-                if new and not getattr(self, "_alert_popup_open", False):
-                    mark_alerts_notified(c, [r["id"] for r in new], self.user)
-                else:
-                    new = []
         except Exception:
             return
         self._update_alert_button(len(low))
-        if new:
-            self._show_alert_popup(new, len(low))
+        if not new:
+            return
+        if getattr(self, "_alert_popup_open", False):
+            return
+        if self._alerts_blocked():
+            # أنت داخل نافذة (إضافة صنف / استيراد فاتورة...): لا نقاطعك، نعيد المحاولة بعد قليل
+            if not getattr(self, "_alert_retry", False):
+                self._alert_retry = True
+                self.after(8000, self._alert_retry_now)
+            return
+        try:
+            with connect() as c:
+                mark_alerts_notified(c, [r["id"] for r in new], self.user)
+        except Exception:
+            return
+        self._show_alert_popup(new, len(low))
+
+    def _alerts_blocked(self):
+        """هل توجد نافذة تحجز الإدخال (حوار مفتوح) أو استيراد فاتورة جارٍ؟"""
+        try:
+            if self.grab_current() is not None:
+                return True
+        except tk.TclError:
+            pass
+        return getattr(self, "_alert_block", 0) > 0
+
+    def _alert_retry_now(self):
+        self._alert_retry = False
+        try:
+            self.check_stock_alerts()
+        except Exception:
+            pass
 
     def _stock_alert_tick(self):
         try:
@@ -4598,10 +4625,7 @@ class App(tk.Tk):
         win.title("🔔 تنبيه نواقص المخزون")
         win.configure(bg=BG)
         win.transient(self)
-        try:
-            win.attributes("-topmost", True)
-        except tk.TclError:
-            pass
+        win.lift()
 
         def close():
             self._alert_popup_open = False
@@ -5839,6 +5863,14 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("استيراد فاتورة مورد من PDF")
+        self._alert_block = getattr(self, "_alert_block", 0) + 1
+
+        def _unblock(e, w=win):
+            if e.widget is w:
+                self._alert_block = max(0, getattr(self, "_alert_block", 1) - 1)
+                self.after(1500, self.check_stock_alerts)
+
+        win.bind("<Destroy>", _unblock)
         win.configure(bg=BG)
         win.transient(self)
         self.center(win, 1260, 800)
