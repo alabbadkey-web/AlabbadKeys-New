@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.3.1"
+APP_VERSION = "16.3.2"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1157,9 +1157,6 @@ def extract_pdf_row_images(path, lines, out_dir=None):
                     best = (w * h, (max(x0, 0), max(top, 0), min(x1, page.width), min(bottom, page.height)), im)
             if not best:
                 continue
-            src = best[2].get("srcsize") or (0, 0)
-            if min(src) and min(src) < 300:
-                continue  # صورة صغيرة جدًا: غالبًا صورة (لا توجد صورة) الافتراضية للمورد
             native = _native_pdf_image(best[2])
             if native is not None:
                 native.thumbnail((700, 700))
