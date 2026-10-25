@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.6.0"
+APP_VERSION = "16.7.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -2935,12 +2935,30 @@ class App(tk.Tk):
             if total > 300 and not messagebox.askyesno("تأكيد", f"سيتم طباعة {total} ملصق. متابعة؟", parent=win):
                 return
             win.destroy()
-            self._print_labels(entries)
+            try:
+                self._print_labels(entries)
+            except Exception as e:
+                messagebox.showerror(
+                    "تعذر تجهيز ملصقات الباركود",
+                    f"حدث خطأ أثناء تجهيز الملصقات أو فتحها للطباعة:\n{type(e).__name__}: {e}",
+                    parent=self,
+                )
 
         ttk.Button(bar, text="🖨  طباعة", style="Success.TButton", command=do_print).pack(side="right", padx=6, ipadx=20, ipady=3)
         ttk.Button(bar, text="العدد = الكمية المتوفرة", command=lambda: fill("qty")).pack(side="left", padx=4)
         ttk.Button(bar, text="العدد = 1", command=lambda: fill("one")).pack(side="left", padx=4)
         self.dialog_size(win, frame, bar, 900)
+        # تأكيد إظهار نافذة الطباعة فوق النافذة الرئيسية في Windows؛ قد تُنشأ
+        # نافذة Toplevel لكنها تبقى خلف البرنامج، فيبدو وكأن الزر لا يستجيب.
+        win.update_idletasks()
+        win.deiconify()
+        win.lift()
+        try:
+            win.attributes("-topmost", True)
+            win.after(250, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+        except Exception:
+            pass
+        win.focus_force()
 
     def _print_labels(self, entries):
         path = os.path.join(tempfile.gettempdir(), "alabbad_barcode.html")
