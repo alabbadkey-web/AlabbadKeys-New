@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.3.3"
+APP_VERSION = "16.4.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -680,6 +680,15 @@ def code39_svg(value):
     return f'<svg xmlns="http://www.w3.org/2000/svg" width="{x + 2:.2f}" height="46" viewBox="0 0 {x + 2:.2f} 46" preserveAspectRatio="none">' + ''.join(parts) + '</svg>'
 
 
+def barcode_label_name(r):
+    """اسم الملصق: نوع القطعة + الشركة + الموديل + نوع المفتاح + الأصل."""
+    make, model = (r["make"] or "").strip(), (r["model"] or "").strip()
+    car = f"{make} {model}".strip() or (r["car"] or "").strip()
+    cat = (r["category"] or "").strip()
+    parts = ["" if cat == "غير محدد" else cat, car, (r["kind"] or "").strip(), (r["origin"] or "").strip()]
+    return " ".join(x for x in parts if x)
+
+
 def make_labels_html(entries):
     """entries: قائمة (رقم الصنف، الاسم، العدد، رمز المورد). الباركود = رقم الصنف-رمز المورد."""
     labels = []
@@ -687,10 +696,10 @@ def make_labels_html(entries):
     for code, name, count, sup_code in entries:
         value = f"{code}-{sup_code}" if sup_code else str(code)
         for _ in range(int(count)):
-            labels.append(f'<section class="label"><div class="brand">العباد للمفاتيح</div><div class="name">{html.escape(str(name))}</div><div class="code">{html.escape(value)}</div><div class="barcode">{code39_svg(value)}</div></section>')
+            labels.append(f'<section class="label"><div class="brand">العباد للمفاتيح</div><div class="name" dir="rtl">{html.escape(str(name))}</div><div class="code">{html.escape(value)}</div><div class="barcode">{code39_svg(value)}</div></section>')
 
     return '''<!doctype html><html lang="ar"><head><meta charset="utf-8"><title>طباعة باركود</title><style>
-@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-around}.brand{font-size:8pt;font-weight:bold}.name{font-size:7pt;max-width:37mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.code{font-size:8pt;font-weight:bold;letter-spacing:.3px}.barcode{width:36mm;height:11mm;display:flex;align-items:center;justify-content:center}.barcode svg{width:36mm;height:10mm} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
+@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-around}.brand{font-size:6.5pt;font-weight:bold}.name{font-size:6.8pt;font-weight:bold;max-width:37mm;line-height:1.2;text-align:center;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.code{font-size:8pt;font-weight:bold;letter-spacing:.3px}.barcode{width:36mm;height:9mm;display:flex;align-items:center;justify-content:center}.barcode svg{width:36mm;height:9mm} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
 
 
 def make_label_html(code, name, count, sup_code=""):
@@ -2192,6 +2201,7 @@ class App(tk.Tk):
             ttk.Button(row, text="تعديل الصنف المحدد", command=lambda: self.edit_item(t)).pack(side="left", padx=4)
         if self.role == "admin" or self.can("inv_edit"):
             ttk.Button(row, text="🧬 فحص المكرر", command=self.duplicates_window).pack(side="left", padx=4)
+            ttk.Button(row, text="🖼 صور من فاتورة", command=self.import_images_only).pack(side="left", padx=4)
         if self.can("shortage"):
             ttk.Button(row, text="🔔 حد التنبيه للمحدد", command=lambda: self.set_min_qty(t)).pack(side="left", padx=4)
         if self.can("barcode"):
@@ -2709,37 +2719,78 @@ class App(tk.Tk):
                 delete_image(old_img)
 
     def print_barcode(self, table):
+        """طباعة الباركود من المخزون: حدد صنفًا أو أكثر، واكتب عدد الملصقات لكل صنف."""
         selected = table.selection()
         if not selected:
-            messagebox.showwarning("تنبيه", "حدد الصنف أولًا")
+            messagebox.showwarning("تنبيه", "حدد صنفًا أو أكثر أولًا (اضغط Ctrl للتحديد المتعدد)")
             return
-        item_id = int(selected[0])
+        none_opt = "(بدون رمز مورد)"
+        items = []
         with connect() as c:
-            r = c.execute("SELECT item_no,part,supplier FROM items WHERE id=?", (item_id,)).fetchone()
-            if not r:
-                return
-            names = [x["supplier"] for x in c.execute("SELECT DISTINCT supplier FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>''", (item_id,)).fetchall()]
-            names += [x["supplier"] for x in c.execute("SELECT supplier FROM item_supplier_codes WHERE item_id=?", (item_id,)).fetchall() if x["supplier"] not in names]
-            if r["supplier"] and r["supplier"] not in names:
-                names.append(r["supplier"])
-        sup_name = None
-        if len(names) == 1:
-            sup_name = names[0]
-        elif len(names) > 1:
-            none_opt = "(بدون رمز مورد)"
-            pick = self.choose_from("مورد الملصق", "هذه القطعة اشتريتها من أكثر من مورد. اختر مورد الملصق:", names + [none_opt])
-            if pick is None:
-                return
-            sup_name = None if pick == none_opt else pick
-        sup_code = ""
-        if sup_name:
-            with connect() as c:
-                sc = c.execute("SELECT code FROM suppliers WHERE name=?", (sup_name,)).fetchone()
-            sup_code = (sc["code"] if sc else "") or ""
-        count = simpledialog.askinteger("عدد الملصقات", f"كم ملصقًا تريد طباعته؟\n(الباركود: {r['item_no']}{'-' + sup_code if sup_code else ''})", minvalue=1, maxvalue=500, parent=self)
-        if not count:
+            for iid in selected:
+                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin FROM items WHERE id=?", (int(iid),)).fetchone()
+                if not r:
+                    continue
+                names = [x["supplier"] for x in c.execute("SELECT DISTINCT supplier FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>''", (r["id"],)).fetchall()]
+                names += [x["supplier"] for x in c.execute("SELECT supplier FROM item_supplier_codes WHERE item_id=?", (r["id"],)).fetchall() if x["supplier"] and x["supplier"] not in names]
+                if r["supplier"] and r["supplier"] not in names:
+                    names.append(r["supplier"])
+                items.append((r, names))
+        if not items:
             return
-        self._print_labels([(r["item_no"], r["part"], count, sup_code)])
+        win = tk.Toplevel(self)
+        win.title("🖨 طباعة الباركود")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(side="bottom", fill="x")
+        frame = self.scroll_area(win)
+        frame.columnconfigure(2, weight=1)
+        ttk.Label(frame, text="اكتب عدد الملصقات لكل صنف (0 = لا تطبع هذا الصنف)", style="Sub.TLabel").grid(row=0, column=0, columnspan=3, sticky="e", pady=(0, 8))
+        for col, txt in ((2, "الصنف (النوع + الشركة + الموديل + المفتاح + الأصل)"), (1, "مورد الملصق"), (0, "العدد")):
+            ttk.Label(frame, text=txt, font=(FONT, 10, "bold")).grid(row=1, column=col, sticky="e", padx=6, pady=(0, 4))
+        rows = []
+        for i, (r, names) in enumerate(items, start=2):
+            ttk.Label(frame, text=f"{r['item_no']}  |  {barcode_label_name(r) or r['part']}  |  متوفر {r['qty'] or 0}", anchor="e", justify="right").grid(row=i, column=2, sticky="e", padx=6, pady=4)
+            cb = ttk.Combobox(frame, values=(names + [none_opt]) if names else [none_opt], state="readonly" if names else "disabled", width=22)
+            cb.set(r["supplier"] if r["supplier"] in names else (names[0] if names else none_opt))
+            cb.grid(row=i, column=1, padx=6)
+            sp = ttk.Spinbox(frame, from_=0, to=500, width=6, justify="center")
+            sp.set(1)
+            sp.grid(row=i, column=0, padx=6)
+            rows.append((r, cb, sp))
+
+        def fill(mode):
+            for r, _cb, sp in rows:
+                sp.set(max(1, int(r["qty"] or 0)) if mode == "qty" else 1)
+
+        def do_print():
+            entries, total = [], 0
+            with connect() as c:
+                for r, cb, sp in rows:
+                    n = max(0, min(int(num(sp.get())), 500))
+                    if n <= 0:
+                        continue
+                    sup = cb.get()
+                    code = ""
+                    if sup and sup != none_opt:
+                        sc = c.execute("SELECT code FROM suppliers WHERE name=?", (sup,)).fetchone()
+                        code = (sc["code"] if sc else "") or ""
+                    entries.append((r["item_no"], barcode_label_name(r) or r["part"], n, code))
+                    total += n
+            if not entries:
+                messagebox.showwarning("تنبيه", "اكتب عددًا أكبر من صفر لصنف واحد على الأقل", parent=win)
+                return
+            if total > 300 and not messagebox.askyesno("تأكيد", f"سيتم طباعة {total} ملصق. متابعة؟", parent=win):
+                return
+            win.destroy()
+            self._print_labels(entries)
+
+        ttk.Button(bar, text="🖨  طباعة", style="Success.TButton", command=do_print).pack(side="right", padx=6, ipadx=20, ipady=3)
+        ttk.Button(bar, text="العدد = الكمية المتوفرة", command=lambda: fill("qty")).pack(side="left", padx=4)
+        ttk.Button(bar, text="العدد = 1", command=lambda: fill("one")).pack(side="left", padx=4)
+        self.dialog_size(win, frame, bar, 900)
 
     def _print_labels(self, entries):
         path = os.path.join(tempfile.gettempdir(), "alabbad_barcode.html")
@@ -3528,10 +3579,10 @@ class App(tk.Tk):
             entries = []
             with connect() as c:
                 for iid in t.selection():
-                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
+                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part,i.category,i.make,i.model,i.car,i.kind,i.origin FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
                     if p_ and p_["item_no"]:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (p_["supplier"],)).fetchone()
-                        entries.append((p_["item_no"], p_["part"], max(int(p_["qty"] or 0), 1), (sc["code"] if sc else "") or ""))
+                        entries.append((p_["item_no"], barcode_label_name(p_) or p_["part"], max(int(p_["qty"] or 0), 1), (sc["code"] if sc else "") or ""))
             if not entries:
                 messagebox.showwarning("تنبيه", "حدد سطرًا أو أكثر من المشتريات أولًا")
                 return
@@ -3552,6 +3603,8 @@ class App(tk.Tk):
             load()
 
         ttk.Button(row, text="📄 استيراد فاتورة PDF", style="Accent.TButton", command=lambda: self.import_pdf_invoice(load)).pack(side="right", padx=4)
+        if self.role == "admin" or self.can("inv_edit"):
+            ttk.Button(row, text="🖼 صور فقط من فاتورة", command=self.import_images_only).pack(side="right", padx=4)
         ttk.Button(row, text="＋ فاتورة شراء جديدة", style="Accent.TButton", command=lambda: self.new_purchase(load)).pack(side="right", padx=4)
         ttk.Button(row, text="🖨 باركود المحدد", command=lambda: print_selected()).pack(side="right", padx=4)
         ttk.Button(row, text="✔ إضافة الفاتورة المحددة للمخزون", style="Success.TButton", command=lambda: receive(self._invoice_pending_ids(t.selection()))).pack(side="right", padx=4)
@@ -5562,6 +5615,149 @@ class App(tk.Tk):
                 self._save_supplier_code(c, ln["item_id"], sup, ln["code"])
                 n += 1
         return n
+
+    # ------------------------------------------------------------- صور الأصناف من فاتورة (حتى لو سُجّلت سابقًا)
+    def _read_invoice_pdf(self, path):
+        try:
+            return parse_supplier_invoice(read_pdf_words(path))
+        except Exception as e:
+            messagebox.showerror("تعذّرت قراءة الملف", str(e))
+            return None
+
+    def _image_plan(self, c, supplier, lines, imgs, replace):
+        """يطابق أسطر الفاتورة مع الأصناف الموجودة (برمز المورد) ويحدد أين تُضاف الصورة."""
+        plan = []
+        for i, ln in enumerate(lines):
+            item_id = self._match_supplier_line(c, supplier, ln["code"])
+            row = c.execute("SELECT item_no,image FROM items WHERE id=?", (item_id,)).fetchone() if item_id else None
+            has_img = bool(row and row["image"])
+            img = imgs.get(i)
+            if not row:
+                action = "غير موجود في المخزون"
+            elif not img:
+                action = "لا توجد صورة في الفاتورة"
+            elif has_img and not replace:
+                action = "له صورة — تخطّي"
+            else:
+                action = "سيُستبدل" if has_img else "سيُضاف"
+            plan.append({"i": i, "n": ln["n"], "code": ln["code"], "desc": ln["desc"], "item_id": item_id,
+                         "item_no": row["item_no"] if row else "", "has_image": has_img, "img": img,
+                         "action": action, "apply": action in ("سيُضاف", "سيُستبدل")})
+        return plan
+
+    def _apply_image_plan(self, plan):
+        n = 0
+        with connect() as c:
+            for p in plan:
+                if not p["apply"]:
+                    continue
+                cur = c.execute("SELECT image FROM items WHERE id=?", (p["item_id"],)).fetchone()
+                c.execute("UPDATE items SET image=? WHERE id=?", (store_image(p["img"]), p["item_id"]))
+                if cur and cur["image"]:
+                    delete_image(cur["image"])
+                n += 1
+        return n
+
+    def import_images_only(self):
+        """يضيف صور فاتورة PDF للأصناف الموجودة (مفيد للفواتير القديمة التي سُجّلت بدون صور)."""
+        if not (self.role == "admin" or self.can("inv_edit")):
+            return
+        path = filedialog.askopenfilename(parent=self, title="اختر فاتورة المورد (PDF)", filetypes=[("PDF", "*.pdf"), ("كل الملفات", "*.*")])
+        if not path:
+            return
+        parsed = self._read_invoice_pdf(path)
+        if not parsed:
+            return
+        if not parsed["lines"]:
+            messagebox.showwarning("تنبيه", "\n".join(parsed["warnings"]) or "لم أجد أصنافًا في الملف")
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            imgs = extract_pdf_row_images(path, parsed["lines"])
+        except Exception:
+            imgs = {}
+        finally:
+            self.config(cursor="")
+        if not imgs:
+            messagebox.showinfo("الصور", "ما وجدت صورًا داخل هذه الفاتورة (ربما هي ممسوحة ضوئيًا).")
+            return
+        with connect() as c:
+            sups = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()]
+        win = tk.Toplevel(self)
+        win.title("🖼 صور الأصناف من فاتورة")
+        win.configure(bg=BG)
+        win.transient(self)
+        self.center(win, 1180, 720)
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(side="bottom", fill="x")
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="إضافة صور الفاتورة للأصناف الموجودة", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(body, text=f"الملف: {os.path.basename(path)} — {len(imgs)} صورة. تُطابق الأسطر مع الأصناف برمز المنتج عند المورد.", style="Sub.TLabel").pack(anchor="e")
+        top = ttk.Frame(body)
+        top.pack(fill="x", pady=8)
+        ttk.Label(top, text="المورد").pack(side="right", padx=4)
+        sup_cb = ttk.Combobox(top, values=sups, state="readonly", width=28)
+        sup_cb.pack(side="right", padx=4)
+        guess = (parsed.get("supplier_guess") or "").lower()
+        pre = next((sp for sp in sups if guess and (sp.lower() in guess or guess in sp.lower())), "")
+        if pre:
+            sup_cb.set(pre)
+        ttk.Label(top, text="الأصناف التي لها صورة").pack(side="right", padx=(18, 4))
+        MODES = ["لا تغيّرها (أضف للأصناف بدون صورة فقط)", "استبدلها بصور الفاتورة"]
+        mode_cb = ttk.Combobox(top, values=MODES, state="readonly", width=36)
+        mode_cb.set(MODES[0])
+        mode_cb.pack(side="right", padx=4)
+        t = make_tree(body, ("n", "code", "desc", "item", "cur", "new", "action"),
+                      {"n": "#", "code": "رمز المورد", "desc": "الوصف", "item": "الصنف في المخزون", "cur": "صورته الحالية", "new": "صورة الفاتورة", "action": "الإجراء"},
+                      {"n": 40, "code": 110, "desc": 340, "item": 120, "cur": 100, "new": 100, "action": 190})
+        sum_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=sum_var, font=(FONT, 11, "bold"), foreground=NAVY).pack(anchor="e", pady=(0, 6))
+        state = {"plan": []}
+
+        def refresh(*_):
+            with connect() as c:
+                plan = self._image_plan(c, sup_cb.get().strip(), parsed["lines"], imgs, mode_cb.get() == MODES[1])
+            state["plan"] = plan
+            clear_tree(t)
+            for p in plan:
+                tag = ("best",) if p["apply"] else (("low",) if p["action"] == "غير موجود في المخزون" else ())
+                add_row(t, (p["n"], p["code"], p["desc"][:70], p["item_no"] or "—", "✔" if p["has_image"] else "—", "📷" if p["img"] else "—", p["action"]), iid=str(p["i"]), extra=tag)
+            n_apply = sum(1 for p in plan if p["apply"])
+            sum_var.set(f"سيتم تحديث صور {n_apply} صنف   |   غير موجود في المخزون: {sum(1 for p in plan if p['action'] == 'غير موجود في المخزون')}")
+
+        def show_img(_e=None):
+            sel = t.selection()
+            if not sel or int(sel[0]) not in imgs:
+                return
+            dlg = tk.Toplevel(win)
+            dlg.title("صورة الفاتورة")
+            dlg.configure(bg=BG)
+            dlg.transient(win)
+            ph = load_photo(imgs[int(sel[0])], (420, 420))
+            lbl = ttk.Label(dlg, image=ph) if ph else ttk.Label(dlg, text="تعذّر عرض الصورة")
+            lbl.image = ph
+            lbl.pack(padx=14, pady=14)
+
+        def save():
+            if not sup_cb.get().strip():
+                messagebox.showwarning("تنبيه", "اختر المورد أولًا (ليتم مطابقة الرموز)", parent=win)
+                return
+            try:
+                n = self._apply_image_plan(state["plan"])
+            except Exception as e:
+                messagebox.showerror("خطأ", str(e), parent=win)
+                return
+            win.destroy()
+            messagebox.showinfo("تم", f"تم تحديث صور {n} صنف.")
+
+        ttk.Button(bar, text="💾  حفظ الصور", style="Success.TButton", command=save).pack(side="right", padx=6, ipadx=20, ipady=3)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+        sup_cb.bind("<<ComboboxSelected>>", refresh)
+        mode_cb.bind("<<ComboboxSelected>>", refresh)
+        t.bind("<Double-1>", show_img)
+        refresh()
 
     def import_pdf_invoice(self, on_done=None):
         if not self.can("purchases"):
