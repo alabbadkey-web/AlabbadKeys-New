@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.4.0"
+APP_VERSION = "16.5.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -650,34 +650,54 @@ def _on_wheel(root, e):
 
 
 # ------------------------------------------------------------------ الباركود
-_CODE39 = {
-    "0": "nnnwwnwnn", "1": "wnnwnnnnw", "2": "nnwwnnnnw", "3": "wnwwnnnnn", "4": "nnnwwnnnw", "5": "wnnwwnnnn", "6": "nnwwwnnnn", "7": "nnnwnnwnw", "8": "wnnwnnwnn", "9": "nnwwnnwnn",
-    "A": "wnnnnwnnw", "B": "nnwnnwnnw", "C": "wnwnnwnnn", "D": "nnnnwwnnw", "E": "wnnnwwnnn", "F": "nnwnwwnnn", "G": "nnnnnwwnw", "H": "wnnnnwwnn", "I": "nnwnnwwnn", "J": "nnnnwwwnn",
-    "K": "wnnnnnnww", "L": "nnwnnnnww", "M": "wnwnnnnwn", "N": "nnnnwnnww", "O": "wnnnwnnwn", "P": "nnwnwnnwn", "Q": "nnnnnnwww", "R": "wnnnnnwwn", "S": "nnwnnnwwn", "T": "nnnnwnwwn",
-    "U": "wwnnnnnnw", "V": "nwwnnnnnw", "W": "wwwnnnnnn", "X": "nwnnwnnnw", "Y": "wwnnwnnnn", "Z": "nwwnwnnnn",
-    "-": "nwnnnnwnw", ".": "wwnnnnwnn", " ": "nwwnnnwnn", "$": "nwnwnwnnn", "/": "nwnwnnnwn", "+": "nwnnnwnwn", "%": "nnnwnwnwn", "*": "nwnnwnwnn"}
+# Code 128: قيمة الرمز -> عروض (خط، فراغ، خط، فراغ، خط، فراغ). الرمز 106 (النهاية) له 7 عناصر.
+_C128 = """212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222
+123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321
+232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121
+313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224
+111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111
+111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113
+114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112""".split()
 
 
-def code39_svg(value):
-    value = str(value).upper()
-    value = ''.join(ch for ch in value if ch in _CODE39 and ch != '*')
-    value = '*' + value + '*'
-    x = 2
-    parts = []
-    narrow = 1.0
-    wide = 2.0
-    height = 42
+def barcode_payload(item_no):
+    """النص الذي يُرمَّز: أرقام فقط (Code 128 فئة C) فيصير الباركود نصف العرض. مثال NEW-0001 -> 77100001.
+    رقم الصنف المكتوب يدويًا (غير NEW/USED) يُرمَّز كما هو بفئة B."""
+    m = re.fullmatch(r"\s*(NEW|USED)-(\d+)\s*", str(item_no or ""), re.I)
+    if m:
+        digits = str(int(m.group(2))).zfill(5)
+        if (3 + len(digits)) % 2:
+            digits = "0" + digits
+        return "77" + ("1" if m.group(1).upper() == "NEW" else "2") + digits, "C"
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in str(item_no or "")), "B"
 
-    for char in value:
-        pat = _CODE39[char]
-        for i, ch in enumerate(pat):
-            width = wide if ch == 'w' else narrow
-            if i % 2 == 0:
-                parts.append(f'<rect x="{x:.2f}" y="2" width="{width:.2f}" height="{height}" fill="#000"/>')
-            x += width
-        x += narrow
 
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{x + 2:.2f}" height="46" viewBox="0 0 {x + 2:.2f} 46" preserveAspectRatio="none">' + ''.join(parts) + '</svg>'
+def code128_symbols(payload, subset):
+    if subset == "C":
+        if len(payload) % 2 or not payload.isdigit():
+            raise ValueError("Code 128 C يحتاج عددًا زوجيًا من الأرقام")
+        vals = [105] + [int(payload[i:i + 2]) for i in range(0, len(payload), 2)]
+    else:
+        vals = [104] + [ord(ch) - 32 for ch in payload]
+    check = (vals[0] + sum(i * v for i, v in enumerate(vals[1:], start=1))) % 103
+    return vals + [check, 106]
+
+
+def code128_svg(payload, subset, height_mm=8.0, max_width_mm=31.0, dot_mm=0.125):
+    """باركود Code 128 بعرض خط = 4 أو 3 أو 2 نقطة طابعة (203 dpi ≈ 0.125 مم للنقطة): أكبر عرض يناسب الملصق."""
+    runs = [int(ch) for v in code128_symbols(payload, subset) for ch in _C128[v]]
+    modules = sum(runs)
+    dots = 4
+    while dots > 2 and modules * dots * dot_mm > max_width_mm:
+        dots -= 1
+    width_mm = modules * dots * dot_mm
+    rects, x = [], 0
+    for i, w in enumerate(runs):
+        if i % 2 == 0:
+            rects.append(f'<rect x="{x}" y="0" width="{w}" height="1"/>')
+        x += w
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width_mm:.3f}mm" height="{height_mm}mm" viewBox="0 0 {modules} 1" '
+            f'preserveAspectRatio="none" shape-rendering="crispEdges" fill="#000">' + "".join(rects) + '</svg>')
 
 
 def barcode_label_name(r):
@@ -689,17 +709,36 @@ def barcode_label_name(r):
     return " ".join(x for x in parts if x)
 
 
-def make_labels_html(entries):
-    """entries: قائمة (رقم الصنف، الاسم، العدد، رمز المورد). الباركود = رقم الصنف-رمز المورد."""
-    labels = []
+def fmt_price(v):
+    v = num(v)
+    return f"{v:.2f}".rstrip("0").rstrip(".") if v else ""
 
-    for code, name, count, sup_code in entries:
-        value = f"{code}-{sup_code}" if sup_code else str(code)
-        for _ in range(int(count)):
-            labels.append(f'<section class="label"><div class="brand">العباد للمفاتيح</div><div class="name" dir="rtl">{html.escape(str(name))}</div><div class="code">{html.escape(value)}</div><div class="barcode">{code39_svg(value)}</div></section>')
+
+def make_labels_html(entries):
+    """entries: قواميس {item_no, name, part, price, count, sup} (أو الشكل القديم: رقم، اسم، عدد، رمز مورد).
+    الملصق 40×30 مم: الاسم، رقم القطعة، الباركود، رقم الصنف، سعر المنتج."""
+    labels = []
+    for e in entries:
+        if not isinstance(e, dict):
+            e = {"item_no": e[0], "name": e[1], "count": e[2], "sup": e[3], "part": "", "price": None}
+        payload, subset = barcode_payload(e["item_no"])
+        svg = code128_svg(payload, subset)
+        shown = f"{e['item_no']}-{e['sup']}" if e.get("sup") else str(e["item_no"])
+        price = fmt_price(e.get("price"))
+        part = f'<div class="row part" dir="rtl">رقم القطعة: <bdi>{html.escape(str(e["part"]))}</bdi></div>' if e.get("part") else ""
+        price_row = f'<div class="row price" dir="rtl">سعر المنتج: <bdi>{html.escape(price)} ر.س</bdi></div>' if price else ""
+        one = (f'<section class="label"><div class="name" dir="rtl">{html.escape(str(e["name"]))}</div>{part}'
+               f'<div class="barcode">{svg}</div><div class="row ino" dir="rtl">رقم الصنف: <bdi>{html.escape(shown)}</bdi></div>{price_row}</section>')
+        labels.extend([one] * int(e["count"]))
 
     return '''<!doctype html><html lang="ar"><head><meta charset="utf-8"><title>طباعة باركود</title><style>
-@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-around}.brand{font-size:6.5pt;font-weight:bold}.name{font-size:6.8pt;font-weight:bold;max-width:37mm;line-height:1.2;text-align:center;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.code{font-size:8pt;font-weight:bold;letter-spacing:.3px}.barcode{width:36mm;height:9mm;display:flex;align-items:center;justify-content:center}.barcode svg{width:36mm;height:9mm} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
+@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}
+.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-between}
+.name{font-size:6.8pt;font-weight:bold;max-width:37mm;line-height:1.15;text-align:center;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.row{max-width:37mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;line-height:1.15}
+.part{font-size:6.5pt}.ino{font-size:7pt;font-weight:bold}.price{font-size:8pt;font-weight:bold}
+.barcode{height:8mm;display:flex;align-items:center;justify-content:center}.barcode svg{display:block}
+@media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
 
 
 def make_label_html(code, name, count, sup_code=""):
@@ -708,6 +747,9 @@ def make_label_html(code, name, count, sup_code=""):
 
 def parse_barcode(text):
     """يفكّ نص الباركود NEW-0001-S03 إلى (رقم الصنف، رمز المورد)."""
+    k = re.fullmatch(r"\s*77([12])(\d{5,})\s*", str(text or ""))
+    if k and (len(k.group(2)) + 3) % 2 == 0:  # الباركود الجديد (Code 128): 77 + حالة + رقم
+        return f"{'NEW' if k.group(1) == '1' else 'USED'}-{int(k.group(2)):04d}", ""
     m = re.fullmatch(r"\s*((?:NEW|USED)-\d+)(?:-([A-Za-z0-9]{1,8}))?\s*", str(text or ""), re.I)
     return (m.group(1).upper(), (m.group(2) or "").upper()) if m else None
 
@@ -2195,24 +2237,26 @@ class App(tk.Tk):
         count_var = tk.StringVar(value="")
         ttk.Label(self.body, textvariable=count_var, style="Muted.TLabel").pack(anchor="e")
 
+        row2 = ttk.Frame(self.body)
+        row2.pack(fill="x", pady=(0, 2), before=t.master)
         if self.can("inv_add"):
             ttk.Button(row, text="＋ إضافة صنف", style="Accent.TButton", command=self.add_item).pack(side="left")
         if self.can("inv_edit"):
             ttk.Button(row, text="تعديل الصنف المحدد", command=lambda: self.edit_item(t)).pack(side="left", padx=4)
         if self.role == "admin" or self.can("inv_edit"):
-            ttk.Button(row, text="🧬 فحص المكرر", command=self.duplicates_window).pack(side="left", padx=4)
-            ttk.Button(row, text="🖼 صور من فاتورة", command=self.import_images_only).pack(side="left", padx=4)
+            ttk.Button(row2, text="🧬 فحص المكرر", command=self.duplicates_window).pack(side="left", padx=4)
+            ttk.Button(row2, text="🖼 صور من فاتورة", command=self.import_images_only).pack(side="left", padx=4)
         if self.can("shortage"):
-            ttk.Button(row, text="🔔 حد التنبيه للمحدد", command=lambda: self.set_min_qty(t)).pack(side="left", padx=4)
+            ttk.Button(row2, text="🔔 حد التنبيه للمحدد", command=lambda: self.set_min_qty(t)).pack(side="left", padx=4)
         if self.can("barcode"):
-            ttk.Button(row, text="طباعة باركود", command=lambda: self.print_barcode(t)).pack(side="left", padx=4)
-        ttk.Button(row, text="🖼 عرض الصورة", command=lambda: self.view_image(int(t.selection()[0])) if t.selection() else messagebox.showwarning("تنبيه", "حدد الصنف أولًا")).pack(side="left", padx=4)
+            ttk.Button(row, text="🖨 طباعة الباركود", style="Success.TButton", command=lambda: self.print_barcode(t)).pack(side="left", padx=4)
+        ttk.Button(row2, text="🖼 عرض الصورة", command=lambda: self.view_image(int(t.selection()[0])) if t.selection() else messagebox.showwarning("تنبيه", "حدد الصنف أولًا")).pack(side="left", padx=4)
         if self.can("po"):
-            ttk.Button(row, text="📝 طلب شراء", style="Accent.TButton", command=self.po_page).pack(side="left", padx=4)
+            ttk.Button(row2, text="📝 طلب شراء", style="Accent.TButton", command=self.po_page).pack(side="left", padx=4)
         if self.can("shortage"):
-            ttk.Button(row, text="📤 النواقص ← مسؤول المشتريات", style="Success.TButton", command=lambda: self.shortage_window(sup.get() if sup.get() != "الكل" else None)).pack(side="left", padx=4)
+            ttk.Button(row2, text="📤 النواقص ← مسؤول المشتريات", style="Success.TButton", command=lambda: self.shortage_window(sup.get() if sup.get() != "الكل" else None)).pack(side="left", padx=4)
         if self.can("view_cost") or self.can("purchases"):
-            ttk.Button(row, text="📉 سجل أسعار الشراء", command=lambda: self.price_history(int(t.selection()[0]) if t.selection() else None)).pack(side="left", padx=4)
+            ttk.Button(row2, text="📉 سجل أسعار الشراء", command=lambda: self.price_history(int(t.selection()[0]) if t.selection() else None)).pack(side="left", padx=4)
 
         def load():
             bm = parse_barcode(q.get())
@@ -2728,7 +2772,7 @@ class App(tk.Tk):
         items = []
         with connect() as c:
             for iid in selected:
-                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin FROM items WHERE id=?", (int(iid),)).fetchone()
+                r = c.execute("SELECT id,item_no,part,supplier,qty,retail,category,make,model,car,kind,origin FROM items WHERE id=?", (int(iid),)).fetchone()
                 if not r:
                     continue
                 names = [x["supplier"] for x in c.execute("SELECT DISTINCT supplier FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>''", (r["id"],)).fetchall()]
@@ -2747,14 +2791,14 @@ class App(tk.Tk):
         bar.pack(side="bottom", fill="x")
         frame = self.scroll_area(win)
         frame.columnconfigure(2, weight=1)
-        ttk.Label(frame, text="اكتب عدد الملصقات لكل صنف (0 = لا تطبع هذا الصنف)", style="Sub.TLabel").grid(row=0, column=0, columnspan=3, sticky="e", pady=(0, 8))
+        ttk.Label(frame, text="اكتب عدد الملصقات لكل صنف (0 = لا تطبع هذا الصنف). يطبع: الاسم، رقم القطعة، الباركود، رقم الصنف، سعر المنتج", style="Sub.TLabel").grid(row=0, column=0, columnspan=3, sticky="e", pady=(0, 8))
         for col, txt in ((2, "الصنف (النوع + الشركة + الموديل + المفتاح + الأصل)"), (1, "مورد الملصق"), (0, "العدد")):
             ttk.Label(frame, text=txt, font=(FONT, 10, "bold")).grid(row=1, column=col, sticky="e", padx=6, pady=(0, 4))
         rows = []
         for i, (r, names) in enumerate(items, start=2):
             ttk.Label(frame, text=f"{r['item_no']}  |  {barcode_label_name(r) or r['part']}  |  متوفر {r['qty'] or 0}", anchor="e", justify="right").grid(row=i, column=2, sticky="e", padx=6, pady=4)
             cb = ttk.Combobox(frame, values=(names + [none_opt]) if names else [none_opt], state="readonly" if names else "disabled", width=22)
-            cb.set(r["supplier"] if r["supplier"] in names else (names[0] if names else none_opt))
+            cb.set(none_opt)  # الباركود الجديد بدون رمز مورد؛ اختر موردًا فقط إذا أردت إظهار رمزه بجانب رقم الصنف
             cb.grid(row=i, column=1, padx=6)
             sp = ttk.Spinbox(frame, from_=0, to=500, width=6, justify="center")
             sp.set(1)
@@ -2777,7 +2821,7 @@ class App(tk.Tk):
                     if sup and sup != none_opt:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (sup,)).fetchone()
                         code = (sc["code"] if sc else "") or ""
-                    entries.append((r["item_no"], barcode_label_name(r) or r["part"], n, code))
+                    entries.append({"item_no": r["item_no"], "name": barcode_label_name(r) or r["part"], "part": r["part"], "price": r["retail"], "count": n, "sup": code})
                     total += n
             if not entries:
                 messagebox.showwarning("تنبيه", "اكتب عددًا أكبر من صفر لصنف واحد على الأقل", parent=win)
@@ -3579,14 +3623,14 @@ class App(tk.Tk):
             entries = []
             with connect() as c:
                 for iid in t.selection():
-                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part,i.category,i.make,i.model,i.car,i.kind,i.origin FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
+                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part,i.retail,i.category,i.make,i.model,i.car,i.kind,i.origin FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
                     if p_ and p_["item_no"]:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (p_["supplier"],)).fetchone()
-                        entries.append((p_["item_no"], barcode_label_name(p_) or p_["part"], max(int(p_["qty"] or 0), 1), (sc["code"] if sc else "") or ""))
+                        entries.append({"item_no": p_["item_no"], "name": barcode_label_name(p_) or p_["part"], "part": p_["part"], "price": p_["retail"], "count": max(int(p_["qty"] or 0), 1), "sup": ""})
             if not entries:
                 messagebox.showwarning("تنبيه", "حدد سطرًا أو أكثر من المشتريات أولًا")
                 return
-            total = sum(e[2] for e in entries)
+            total = sum(e["count"] for e in entries)
             if messagebox.askyesno("طباعة الباركود", f"سيتم طباعة {total} ملصق (ملصق لكل قطعة) برمز المورد على الباركود. متابعة؟"):
                 self._print_labels(entries)
 
