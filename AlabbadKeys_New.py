@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.4.1"
+APP_VERSION = "16.4.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -690,32 +690,20 @@ def barcode_label_name(r):
 
 
 def make_labels_html(entries):
-    """ملصقات 40×30 مم. كل سجل: رقم الصنف، الاسم، العدد، رمز المورد، رقم القطعة، السعر."""
+    """entries: قائمة (رقم الصنف، الاسم، العدد، رمز المورد). الباركود = رقم الصنف-رمز المورد."""
     labels = []
-    for item_no, name, count, sup_code, part_no, price in entries:
-        barcode_value = f"{item_no}-{sup_code}" if sup_code else str(item_no)
-        safe_name = html.escape(str(name or ""))
-        safe_part = html.escape(str(part_no or ""))
-        safe_item_no = html.escape(str(item_no or ""))
-        safe_price = html.escape(f"{num(price):.2f} ر.س" if price not in (None, "") else "")
-        barcode = code39_svg(barcode_value)
+
+    for code, name, count, sup_code in entries:
+        value = f"{code}-{sup_code}" if sup_code else str(code)
         for _ in range(int(count)):
-            labels.append(
-                '<section class="label">'
-                f'<div class="name" dir="rtl">{safe_name}</div>'
-                f'<div class="details" dir="rtl"><span>القطعة: {safe_part}</span>'
-                f'<span>الصنف: {safe_item_no}</span><span>السعر: {safe_price}</span></div>'
-                f'<div class="barcode">{barcode}</div>'
-                f'<div class="code">{html.escape(barcode_value)}</div>'
-                '</section>'
-            )
+            labels.append(f'<section class="label"><div class="brand">العباد للمفاتيح</div><div class="name" dir="rtl">{html.escape(str(name))}</div><div class="code">{html.escape(value)}</div><div class="barcode">{code39_svg(value)}</div></section>')
 
     return '''<!doctype html><html lang="ar"><head><meta charset="utf-8"><title>طباعة باركود</title><style>
-@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:0.7mm 1mm;overflow:hidden;page-break-after:always;break-after:page;display:flex;flex-direction:column;align-items:center;justify-content:space-evenly}.name{font-size:6.5pt;font-weight:bold;max-width:38mm;line-height:1.05;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:clip}.details{width:100%;display:flex;flex-direction:column;align-items:center;gap:0.2mm;font-size:5.5pt;font-weight:bold;line-height:1.05;white-space:nowrap}.barcode{width:38mm;height:12mm;display:flex;align-items:center;justify-content:center;flex-shrink:0}.barcode svg{display:block;width:38mm;height:12mm}.code{font-size:6pt;font-weight:bold;letter-spacing:.2px;line-height:1} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
+@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-around}.brand{font-size:6.5pt;font-weight:bold}.name{font-size:6.8pt;font-weight:bold;max-width:37mm;line-height:1.2;text-align:center;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.code{font-size:8pt;font-weight:bold;letter-spacing:.3px}.barcode{width:36mm;height:9mm;display:flex;align-items:center;justify-content:center}.barcode svg{width:36mm;height:9mm} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
 
 
-def make_label_html(code, name, count, sup_code="", part_no="", price=""):
-    return make_labels_html([(code, name, count, sup_code, part_no, price)])
+def make_label_html(code, name, count, sup_code=""):
+    return make_labels_html([(code, name, count, sup_code)])
 
 
 def parse_barcode(text):
@@ -2740,7 +2728,7 @@ class App(tk.Tk):
         items = []
         with connect() as c:
             for iid in selected:
-                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin,retail FROM items WHERE id=?", (int(iid),)).fetchone()
+                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin FROM items WHERE id=?", (int(iid),)).fetchone()
                 if not r:
                     continue
                 names = [x["supplier"] for x in c.execute("SELECT DISTINCT supplier FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>''", (r["id"],)).fetchall()]
@@ -2789,7 +2777,7 @@ class App(tk.Tk):
                     if sup and sup != none_opt:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (sup,)).fetchone()
                         code = (sc["code"] if sc else "") or ""
-                    entries.append((r["item_no"], barcode_label_name(r) or r["part"], n, code, r["part"] or "", r["retail"]))
+                    entries.append((r["item_no"], barcode_label_name(r) or r["part"], n, code))
                     total += n
             if not entries:
                 messagebox.showwarning("تنبيه", "اكتب عددًا أكبر من صفر لصنف واحد على الأقل", parent=win)
