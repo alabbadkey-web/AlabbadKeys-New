@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.5.0"
+APP_VERSION = "16.6.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -2856,6 +2856,19 @@ class App(tk.Tk):
                 delete_image(old_img)
 
     def print_barcode(self, table):
+        """تشغيل نافذة طباعة الباركود مع إظهار أي خطأ بدل توقف الزر بصمت."""
+        try:
+            return self._print_barcode_impl(table)
+        except Exception as e:
+            try:
+                messagebox.showerror(
+                    "تعذر فتح طباعة الباركود",
+                    f"حدث خطأ أثناء تجهيز نافذة طباعة الباركود:\n{type(e).__name__}: {e}"
+                , parent=self)
+            except Exception:
+                messagebox.showerror("تعذر فتح طباعة الباركود", str(e))
+
+    def _print_barcode_impl(self, table):
         """طباعة الباركود من المخزون: حدد صنفًا أو أكثر، واكتب عدد الملصقات لكل صنف."""
         selected = table.selection()
         if not selected:
