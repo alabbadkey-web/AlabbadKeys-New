@@ -1,4 +1,4 @@
-import tkinter as tk
+﻿import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import re, sqlite3, os, sys, hashlib, secrets, hmac, shutil, tempfile, webbrowser, html, json, threading, zipfile
 import subprocess, ssl
@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.4.0"
+APP_VERSION = "16.5.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -490,6 +490,8 @@ def init():
 
         c.execute("INSERT OR IGNORE INTO settings VALUES('expense','0')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('profit','25')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES('label_w','50')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES('label_h','30')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('sheets_url','')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('sheets_token','')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('sheets_last_sync','')")
@@ -650,34 +652,106 @@ def _on_wheel(root, e):
 
 
 # ------------------------------------------------------------------ الباركود
-_CODE39 = {
-    "0": "nnnwwnwnn", "1": "wnnwnnnnw", "2": "nnwwnnnnw", "3": "wnwwnnnnn", "4": "nnnwwnnnw", "5": "wnnwwnnnn", "6": "nnwwwnnnn", "7": "nnnwnnwnw", "8": "wnnwnnwnn", "9": "nnwwnnwnn",
-    "A": "wnnnnwnnw", "B": "nnwnnwnnw", "C": "wnwnnwnnn", "D": "nnnnwwnnw", "E": "wnnnwwnnn", "F": "nnwnwwnnn", "G": "nnnnnwwnw", "H": "wnnnnwwnn", "I": "nnwnnwwnn", "J": "nnnnwwwnn",
-    "K": "wnnnnnnww", "L": "nnwnnnnww", "M": "wnwnnnnwn", "N": "nnnnwnnww", "O": "wnnnwnnwn", "P": "nnwnwnnwn", "Q": "nnnnnnwww", "R": "wnnnnnwwn", "S": "nnwnnnwwn", "T": "nnnnwnwwn",
-    "U": "wwnnnnnnw", "V": "nwwnnnnnw", "W": "wwwnnnnnn", "X": "nwnnwnnnw", "Y": "wwnnwnnnn", "Z": "nwwnwnnnn",
-    "-": "nwnnnnwnw", ".": "wwnnnnwnn", " ": "nwwnnnwnn", "$": "nwnwnwnnn", "/": "nwnwnnnwn", "+": "nwnnnwnwn", "%": "nnnwnwnwn", "*": "nwnnwnwnn"}
+# Code 128 (المجموعة B). كل رمز 11 موديول، ورمز الإيقاف 13 موديول.
+# Code 128 أضيق بكثير من Code 39 وأدق في الطباعة الحرارية، وقارئ 1200g يقرأه افتراضيًا.
+_CODE128 = """212222 222122 222221 121223 121322 131222 122213 122312 132212 221213
+221312 231212 112232 122132 122231 113222 123122 123221 223211 221132
+221231 213212 223112 312131 311222 321122 321221 312212 322112 322211
+212123 212321 232121 111323 131123 131321 112313 132113 132311 211313
+231113 231311 112133 112331 132131 113123 113321 133121 313121 211331
+231131 213113 213311 213131 311123 311321 331121 312113 312311 332111
+314111 221411 431111 111224 111422 121124 121421 141122 141221 112214
+112412 122114 122411 142112 142211 241211 221114 413111 241112 134111
+111242 121142 121241 114212 124112 124211 411212 421112 421211 212141
+214121 412121 111143 111341 131141 114113 114311 411113 411311 113141
+114131 311141 411131 211412 211214 211232 2331112""".split()
+
+# مقاسات الملصق: تُقرأ من الإعدادات (label_w / label_h) — الافتراضي 50×30 مم.
+# عرض الوحدة يُحسب من عدد الأعمدة حتى يُرسم الرمز بدقة داخل أي مقاس ملصق.
+LABEL_DEFAULT_W, LABEL_DEFAULT_H = 50.0, 30.0
+LABEL_W_MIN, LABEL_W_MAX = 30.0, 110.0
+LABEL_H_MIN, LABEL_H_MAX = 22.0, 60.0
+LABEL_EDGE_MM = 0.5       # هامش الملصق يمين ويسار
+QUIET_MIN_MM = 2.25       # أقل منطقة بيضاء مطلوبة على كل جهة من الباركود
+MODULE_MAX_MM = 0.375     # أقصى عرض للوحدة الواحدة (3 نقاط)
+DOT_MM = 0.125            # نقطة الطباعة الحرارية المعتادة (203dpi) — عرض الوحدة لازم يكون مضاعفها
 
 
-def code39_svg(value):
-    value = str(value).upper()
-    value = ''.join(ch for ch in value if ch in _CODE39 and ch != '*')
-    value = '*' + value + '*'
-    x = 2
-    parts = []
-    narrow = 1.0
-    wide = 2.0
-    height = 42
+def label_size():
+    """مقاس ملصق الباركود بالمليمتر (العرض، الارتفاع) من الإعدادات."""
+    def one(key, default, lo, hi):
+        try:
+            v = float(str(setting(key) or "").replace(",", ".").strip())
+        except (TypeError, ValueError):
+            return default
+        if not (v > 0):
+            return default
+        return min(max(v, lo), hi)
 
-    for char in value:
-        pat = _CODE39[char]
-        for i, ch in enumerate(pat):
-            width = wide if ch == 'w' else narrow
-            if i % 2 == 0:
-                parts.append(f'<rect x="{x:.2f}" y="2" width="{width:.2f}" height="{height}" fill="#000"/>')
-            x += width
-        x += narrow
+    return (one("label_w", LABEL_DEFAULT_W, LABEL_W_MIN, LABEL_W_MAX),
+            one("label_h", LABEL_DEFAULT_H, LABEL_H_MIN, LABEL_H_MAX))
 
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{x + 2:.2f}" height="46" viewBox="0 0 {x + 2:.2f} 46" preserveAspectRatio="none">' + ''.join(parts) + '</svg>'
+
+def label_metrics():
+    """(العرض، الارتفاع، عامل تكبير الخطوط، ارتفاع الباركود) حسب مقاس الملصق الحالي."""
+    width_mm, height_mm = label_size()
+    scale = min(max(height_mm / 30.0, 0.7), 1.25)
+    bar_mm = round(min(max(height_mm / 3.0, 6.0), 14.0), 2)
+    return width_mm, height_mm, scale, bar_mm
+
+
+def code128_modules(value):
+    """يرجع (قائمة الأعمدة بالموديولات، النص المشفَّر) لرمز Code 128 — المجموعة B."""
+    text = "".join(ch for ch in str(value or "").upper() if 32 <= ord(ch) <= 126)
+    if not text:
+        return [], ""
+    vals = [104] + [ord(ch) - 32 for ch in text]
+    vals.append((vals[0] + sum(i * v for i, v in enumerate(vals[1:], 1))) % 103)
+    vals.append(106)  # رمز الإيقاف
+    modules = []
+    for v in vals:
+        for j, w in enumerate(_CODE128[v]):
+            modules.extend([j % 2 == 0] * int(w))  # كل رمز يبدأ بعمود أسود
+    return modules, text
+
+
+def barcode_bits(value, width_mm=None):
+    """يرجع (عدد الأعمدة، عرض الوحدة بالمليمتر، العرض الكلي بالمليمتر).
+
+    عرض الوحدة يُقرّب لمضاعف نقطة الطباعة (0.125 مم) حتى تطبع كل نقطة كاملة دون تدوير،
+    والمساحة البيضاء المتبقية على الجانبين تصير منطقة الحماية (quiet zone) للباركود.
+    """
+    modules, _ = code128_modules(value)
+    if not modules:
+        return 0, 0.0, 0.0
+    width_mm = width_mm or label_size()[0]
+    span = width_mm - 2 * LABEL_EDGE_MM - 2 * QUIET_MIN_MM
+    exact = span / len(modules)
+    # نستخدم عرض وحدة ثابتًا بمضاعفات نقاط الطابعة الحرارية (203dpi).
+    # لا نمدد الباركود لملء العرض؛ إذا طال الرمز نقلل عدد الحروف المشفرة بدلًا من تصغير النقطة.
+    dots = int(min(MODULE_MAX_MM, exact) / DOT_MM)
+    if dots < 2:
+        # لا نطبع وحدات أدق من نقطتين؛ نترك الباركود بعرضه الطبيعي حتى لا يصبح غير مقروء.
+        module = 2 * DOT_MM
+    else:
+        module = dots * DOT_MM
+    return len(modules), module, module * len(modules)
+
+
+def barcode_svg(value, height_mm=None, width_mm=None):
+    """باركود Code 128 بمقاسات حقيقية بالمليمتر (بدون تمديد أو ضغط أعمدة الرمز)."""
+    modules, _ = code128_modules(value)
+    if not modules:
+        return ""
+    height_mm = height_mm or label_metrics()[3]
+    width_mm = width_mm or label_size()[0]
+    _, module, width = barcode_bits(value, width_mm)
+    rects = "".join(
+        f'<rect x="{i * module:.3f}" y="0" width="{module:.3f}" height="{height_mm}" fill="#000"/>'
+        for i, on in enumerate(modules) if on
+    )
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.2f}mm" height="{height_mm}mm" '
+            f'viewBox="0 0 {width:.3f} {height_mm}" shape-rendering="crispEdges">{rects}</svg>')
 
 
 def barcode_label_name(r):
@@ -689,21 +763,84 @@ def barcode_label_name(r):
     return " ".join(x for x in parts if x)
 
 
+# قالب الملصق: يُعاد حسابه على مقاس الملصق المحدد في الإعدادات.
+_LABEL_CSS = (
+    "@page{size:[[W]]mm [[H]]mm;margin:0}"
+    "*{box-sizing:border-box}"
+    "html,body{margin:0;padding:0;width:[[W]]mm;font-family:Arial,'Segoe UI',sans-serif}"
+    ".label{width:[[W]]mm;height:[[H]]mm;padding:1mm [[EDGE]]mm;overflow:hidden;page-break-after:always;"
+    "display:flex;flex-direction:column;align-items:center;justify-content:space-between;text-align:center}"
+    ".label:last-child{page-break-after:auto}"
+    ".brand{font-size:[[FB]]pt;font-weight:bold}"
+    ".name{font-size:[[FN]]pt;font-weight:bold;line-height:1.15;max-height:[[NAMEMAX]]mm;overflow:hidden;"
+    "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}"
+    ".part{font-size:[[FP]]pt;line-height:1.15;white-space:nowrap;overflow:hidden;max-width:[[CONTENT]]mm}"
+    ".itemno{font-size:[[FI]]pt;font-weight:bold;white-space:nowrap;overflow:hidden;max-width:[[CONTENT]]mm;letter-spacing:.2px}"
+    ".price{font-size:[[FPR]]pt;font-weight:bold;line-height:1.05;white-space:nowrap;max-width:[[CONTENT]]mm}"
+    ".barcode{display:flex;align-items:center;justify-content:center}"
+    ".barcode svg{display:block}"
+    "@media screen{body{width:auto;background:#ddd;padding:6mm}"
+    ".label{background:#fff;margin:0 auto 4mm;box-shadow:0 0 2mm #888}}"
+)
+
+
+def label_css(width_mm, height_mm, scale=1.0):
+    """CSS الملصق: الخطوط والحدود تتغير حسب عرض/ارتفاع الملصق المحدد."""
+    css = _LABEL_CSS
+    for key, val in {
+        "[[W]]": f"{width_mm:g}",
+        "[[H]]": f"{height_mm:g}",
+        "[[EDGE]]": f"{LABEL_EDGE_MM:g}",
+        "[[FB]]": f"{5.4 * scale:.2f}",
+        "[[FN]]": f"{6.3 * scale:.2f}",
+        "[[NAMEMAX]]": f"{5.1 * scale:.2f}",
+        "[[FP]]": f"{6.5 * scale:.2f}",
+        "[[FI]]": f"{7.8 * scale:.2f}",
+        "[[FPR]]": f"{8.4 * scale:.2f}",
+        "[[CONTENT]]": f"{max(width_mm - 2 * LABEL_EDGE_MM, 20):.2f}",
+    }.items():
+        css = css.replace(key, val)
+    return css
+
+
 def make_labels_html(entries):
-    """entries: قائمة (رقم الصنف، الاسم، العدد، رمز المورد). الباركود = رقم الصنف-رمز المورد."""
+    """entries: قائمة (رقم الصنف، رقم القطعة، الاسم، العدد، رمز المورد، سعر المفرد).
+
+    الملصق يحتوي: نوع القطعة + الشركة + الموديل + نوع المفتاح + الأصل، ثم رقم القطعة، ثم رقم الصنف،
+    ثم الباركود، ثم سعر المفرد تحته. المقاس يُقرأ من الإعدادات (label_w / label_h).
+    الباركود يشفر رقم الصنف فقط (مثال USED-0005) لتقليل العرض؛ رمز المورد لا يضاف إلى الباركود.
+    """
     labels = []
+    width_mm, height_mm, scale, bar_mm = label_metrics()
 
-    for code, name, count, sup_code in entries:
-        value = f"{code}-{sup_code}" if sup_code else str(code)
+    for code, part, name, count, sup_code, retail in entries:
+        code = str(code or "")
+        # لا نضيف رمز المورد إلى البيانات المشفرة؛ هذا يقلل عرض الباركود على ملصق 50 مم.
+        # رقم الصنف الظاهر على الملصق يبقى كاملًا كما هو في قاعدة البيانات.
+        value = code
+        svg = barcode_svg(value, bar_mm, width_mm)
+        part_txt = f'<div class="part" dir="rtl">رقم القطعة: <bdi>{html.escape(str(part))}</bdi></div>' if part else ""
+        name_txt = f'<div class="name" dir="rtl">{html.escape(str(name))}</div>' if name else ""
+        price = num(retail)
+        price_txt = f'<div class="price" dir="rtl">سعر مفرد: <bdi>{price:,.2f}</bdi> ر.س</div>'
         for _ in range(int(count)):
-            labels.append(f'<section class="label"><div class="brand">العباد للمفاتيح</div><div class="name" dir="rtl">{html.escape(str(name))}</div><div class="code">{html.escape(value)}</div><div class="barcode">{code39_svg(value)}</div></section>')
+            labels.append(
+                '<section class="label">'
+                '<div class="brand">العباد للمفاتيح</div>'
+                f'{name_txt}{part_txt}'
+                f'<div class="itemno" dir="rtl">رقم الصنف: <bdi>{html.escape(value)}</bdi></div>'
+                f'<div class="barcode">{svg}</div>'
+                f'{price_txt}'
+                '</section>'
+            )
 
-    return '''<!doctype html><html lang="ar"><head><meta charset="utf-8"><title>طباعة باركود</title><style>
-@page{size:40mm 30mm;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;width:40mm;font-family:Arial,sans-serif}.label{width:40mm;height:30mm;padding:1mm 1.5mm;overflow:hidden;page-break-after:always;display:flex;flex-direction:column;align-items:center;justify-content:space-around}.brand{font-size:6.5pt;font-weight:bold}.name{font-size:6.8pt;font-weight:bold;max-width:37mm;line-height:1.2;text-align:center;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.code{font-size:8pt;font-weight:bold;letter-spacing:.3px}.barcode{width:36mm;height:9mm;display:flex;align-items:center;justify-content:center}.barcode svg{width:36mm;height:9mm} @media screen{body{background:#ddd}.label{background:#fff;margin:5mm auto;box-shadow:0 0 2mm #888}}</style></head><body>''' + ''.join(labels) + '''<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'''
+    head = ('<!doctype html><html lang="ar"><head><meta charset="utf-8"><title>طباعة باركود</title><style>'
+            + label_css(width_mm, height_mm, scale) + '</style></head><body>')
+    return head + ''.join(labels) + '<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'
 
 
-def make_label_html(code, name, count, sup_code=""):
-    return make_labels_html([(code, name, count, sup_code)])
+def make_label_html(code, name, count, sup_code="", part="", retail=0):
+    return make_labels_html([(code, part, name, count, sup_code, retail)])
 
 
 def parse_barcode(text):
@@ -2728,7 +2865,7 @@ class App(tk.Tk):
         items = []
         with connect() as c:
             for iid in selected:
-                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin FROM items WHERE id=?", (int(iid),)).fetchone()
+                r = c.execute("SELECT id,item_no,part,supplier,qty,category,make,model,car,kind,origin,retail FROM items WHERE id=?", (int(iid),)).fetchone()
                 if not r:
                     continue
                 names = [x["supplier"] for x in c.execute("SELECT DISTINCT supplier FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>''", (r["id"],)).fetchall()]
@@ -2777,7 +2914,7 @@ class App(tk.Tk):
                     if sup and sup != none_opt:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (sup,)).fetchone()
                         code = (sc["code"] if sc else "") or ""
-                    entries.append((r["item_no"], barcode_label_name(r) or r["part"], n, code))
+                    entries.append((r["item_no"], r["part"] or "", barcode_label_name(r), n, code, r["retail"]))
                     total += n
             if not entries:
                 messagebox.showwarning("تنبيه", "اكتب عددًا أكبر من صفر لصنف واحد على الأقل", parent=win)
@@ -3579,15 +3716,15 @@ class App(tk.Tk):
             entries = []
             with connect() as c:
                 for iid in t.selection():
-                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part,i.category,i.make,i.model,i.car,i.kind,i.origin FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
+                    p_ = c.execute("SELECT p.qty,p.supplier,i.item_no,i.part,i.category,i.make,i.model,i.car,i.kind,i.origin,i.retail FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?", (int(iid),)).fetchone()
                     if p_ and p_["item_no"]:
                         sc = c.execute("SELECT code FROM suppliers WHERE name=?", (p_["supplier"],)).fetchone()
-                        entries.append((p_["item_no"], barcode_label_name(p_) or p_["part"], max(int(p_["qty"] or 0), 1), (sc["code"] if sc else "") or ""))
+                        entries.append((p_["item_no"], p_["part"] or "", barcode_label_name(p_), max(int(p_["qty"] or 0), 1), (sc["code"] if sc else "") or "", p_["retail"]))
             if not entries:
                 messagebox.showwarning("تنبيه", "حدد سطرًا أو أكثر من المشتريات أولًا")
                 return
             total = sum(e[2] for e in entries)
-            if messagebox.askyesno("طباعة الباركود", f"سيتم طباعة {total} ملصق (ملصق لكل قطعة) برمز المورد على الباركود. متابعة؟"):
+            if messagebox.askyesno("طباعة الباركود", f"سيتم طباعة {total} ملصق (ملصق لكل قطعة) مع رقم القطعة ورقم الصنف وسعر المفرد. متابعة؟"):
                 self._print_labels(entries)
 
         def delete_sel():
@@ -4586,13 +4723,33 @@ class App(tk.Tk):
         ttk.Button(box, text="📞  مسؤول المشتريات (واتساب النواقص)", command=self.purchasing_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="👤  جوال المدير لاستلام طلبات الموظفين", command=self.manager_phone_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="🗂  نسخة كاملة (قاعدة البيانات + الصور)", command=self.backup_full).pack(fill="x", pady=5)
+        ttk.Button(box, text="🏷  مقاس ملصق الباركود", style="Accent.TButton",
+                   command=lambda: self.label_size_dialog(self.settings)).pack(fill="x", pady=5)
         ttk.Label(self.body, text="رابط Google Apps Script ورمز المزامنة يُحفظان محليًا", style="Muted.TLabel").pack(anchor="e", pady=4)
+        ttk.Label(self.body, text=f"مقاس ملصق الباركود الحالي: {label_size()[0]:g} × {label_size()[1]:g} مم", style="Muted.TLabel").pack(anchor="e", pady=4)
         last_sync = setting("sheets_last_sync")
         last_err = setting("sheets_last_error")
         if last_sync:
             ttk.Label(self.body, text="آخر مزامنة ناجحة: " + last_sync).pack(anchor="e")
         if last_err:
             ttk.Label(self.body, text="آخر خطأ مزامنة: " + last_err, foreground=RED).pack(anchor="e")
+
+    def label_size_dialog(self, on_done=None):
+        """مقاس ملصق الباركود: عرض الأعمدة والنصوص والباركود يتحسبون تلقائيًا على المقاس الجديد."""
+        def save(d):
+            w, h = num(d["label_w"]), num(d["label_h"])
+            if not (LABEL_W_MIN <= w <= LABEL_W_MAX):
+                raise ValueError(f"عرض الملصق لازم يكون بين {LABEL_W_MIN:g} و {LABEL_W_MAX:g} مم")
+            if not (LABEL_H_MIN <= h <= LABEL_H_MAX):
+                raise ValueError(f"ارتفاع الملصق لازم يكون بين {LABEL_H_MIN:g} و {LABEL_H_MAX:g} مم")
+            setsetting("label_w", f"{w:g}")
+            setsetting("label_h", f"{h:g}")
+
+        cur_w, cur_h = label_size()
+        self.form("مقاس ملصق الباركود",
+                  [("label_w", "عرض الملصق (مم)", f"{cur_w:g}"),
+                   ("label_h", "ارتفاع الملصق (مم)", f"{cur_h:g}")],
+                  save, on_done=on_done)
 
     # ------------------------------------------------------------- نواقص المخزون
     # ------------------------------------------------------------- تنبيهات النواقص (تلقائية)
