@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.0"
+APP_VERSION = "16.8.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -727,14 +727,8 @@ def barcode_bits(value, width_mm=None):
     width_mm = width_mm or label_size()[0]
     span = width_mm - 2 * LABEL_EDGE_MM - 2 * QUIET_MIN_MM
     exact = span / len(modules)
-    # نستخدم عرض وحدة ثابتًا بمضاعفات نقاط الطابعة الحرارية (203dpi).
-    # لا نمدد الباركود لملء العرض؛ إذا طال الرمز نقلل عدد الحروف المشفرة بدلًا من تصغير النقطة.
-    dots = int(min(MODULE_MAX_MM, exact) / DOT_MM)
-    if dots < 2:
-        # لا نطبع وحدات أدق من نقطتين؛ نترك الباركود بعرضه الطبيعي حتى لا يصبح غير مقروء.
-        module = 2 * DOT_MM
-    else:
-        module = dots * DOT_MM
+    dots = int(min(MODULE_MAX_MM, exact) / DOT_MM)  # أكبر عدد نقاط كاملة يدخل داخل الملصق
+    module = dots * DOT_MM if dots >= 2 else exact   # أقل من نقطتين: نستخدم كامل العرض المتاح
     return len(modules), module, module * len(modules)
 
 
@@ -808,27 +802,26 @@ def make_labels_html(entries):
 
     الملصق يحتوي: نوع القطعة + الشركة + الموديل + نوع المفتاح + الأصل، ثم رقم القطعة، ثم رقم الصنف،
     ثم الباركود، ثم سعر المفرد تحته. المقاس يُقرأ من الإعدادات (label_w / label_h).
-    الباركود يشفر رقم الصنف فقط (مثال USED-0005) لتقليل العرض؛ رمز المورد لا يضاف إلى الباركود.
+    الباركود يشفّر رقم الصنف الأساسي فقط لتقليل العرض، بينما يبقى رقم الصنف الظاهر كاملًا في الملصق.
     """
     labels = []
     width_mm, height_mm, scale, bar_mm = label_metrics()
 
     for code, part, name, count, sup_code, retail in entries:
         code = str(code or "")
-        # لا نضيف رمز المورد إلى البيانات المشفرة؛ هذا يقلل عرض الباركود على ملصق 50 مم.
-        # رقم الصنف الظاهر على الملصق يبقى كاملًا كما هو في قاعدة البيانات.
+        # نحتفظ برقم الصنف كما هو ظاهرًا، لكن نزيل رمز المورد من الباركود لتقصير الرمز.
         value = code
         svg = barcode_svg(value, bar_mm, width_mm)
         part_txt = f'<div class="part" dir="rtl">رقم القطعة: <bdi>{html.escape(str(part))}</bdi></div>' if part else ""
         name_txt = f'<div class="name" dir="rtl">{html.escape(str(name))}</div>' if name else ""
         price = num(retail)
-        price_txt = f'<div class="price" dir="rtl">سعر مفرد: <bdi>{price:,.2f}</bdi> ر.س</div>'
+        price_txt = f'<div class="price" dir="rtl">سعر المفرد: <bdi>{price:,.2f}</bdi> ر.س</div>'
         for _ in range(int(count)):
             labels.append(
                 '<section class="label">'
                 '<div class="brand">العباد للمفاتيح</div>'
                 f'{name_txt}{part_txt}'
-                f'<div class="itemno" dir="rtl">رقم الصنف: <bdi>{html.escape(value)}</bdi></div>'
+                f'<div class="itemno" dir="rtl">رقم الصنف: <bdi>{html.escape(code)}</bdi></div>'
                 f'<div class="barcode">{svg}</div>'
                 f'{price_txt}'
                 '</section>'
@@ -2856,19 +2849,6 @@ class App(tk.Tk):
                 delete_image(old_img)
 
     def print_barcode(self, table):
-        """تشغيل نافذة طباعة الباركود مع إظهار أي خطأ بدل توقف الزر بصمت."""
-        try:
-            return self._print_barcode_impl(table)
-        except Exception as e:
-            try:
-                messagebox.showerror(
-                    "تعذر فتح طباعة الباركود",
-                    f"حدث خطأ أثناء تجهيز نافذة طباعة الباركود:\n{type(e).__name__}: {e}"
-                , parent=self)
-            except Exception:
-                messagebox.showerror("تعذر فتح طباعة الباركود", str(e))
-
-    def _print_barcode_impl(self, table):
         """طباعة الباركود من المخزون: حدد صنفًا أو أكثر، واكتب عدد الملصقات لكل صنف."""
         selected = table.selection()
         if not selected:
@@ -2935,30 +2915,12 @@ class App(tk.Tk):
             if total > 300 and not messagebox.askyesno("تأكيد", f"سيتم طباعة {total} ملصق. متابعة؟", parent=win):
                 return
             win.destroy()
-            try:
-                self._print_labels(entries)
-            except Exception as e:
-                messagebox.showerror(
-                    "تعذر تجهيز ملصقات الباركود",
-                    f"حدث خطأ أثناء تجهيز الملصقات أو فتحها للطباعة:\n{type(e).__name__}: {e}",
-                    parent=self,
-                )
+            self._print_labels(entries)
 
         ttk.Button(bar, text="🖨  طباعة", style="Success.TButton", command=do_print).pack(side="right", padx=6, ipadx=20, ipady=3)
         ttk.Button(bar, text="العدد = الكمية المتوفرة", command=lambda: fill("qty")).pack(side="left", padx=4)
         ttk.Button(bar, text="العدد = 1", command=lambda: fill("one")).pack(side="left", padx=4)
         self.dialog_size(win, frame, bar, 900)
-        # تأكيد إظهار نافذة الطباعة فوق النافذة الرئيسية في Windows؛ قد تُنشأ
-        # نافذة Toplevel لكنها تبقى خلف البرنامج، فيبدو وكأن الزر لا يستجيب.
-        win.update_idletasks()
-        win.deiconify()
-        win.lift()
-        try:
-            win.attributes("-topmost", True)
-            win.after(250, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
-        except Exception:
-            pass
-        win.focus_force()
 
     def _print_labels(self, entries):
         path = os.path.join(tempfile.gettempdir(), "alabbad_barcode.html")
