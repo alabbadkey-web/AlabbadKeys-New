@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.5.0"
+APP_VERSION = "16.6.1"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -37,6 +37,7 @@ PERMS = [
     ("sell_wholesale", "البيع بالجملة", False),
     ("below_price", "البيع بأقل من الحد المسموح", False),
     ("sales_all", "رؤية مبيعات كل الموظفين", False),
+    ("returns", "إلغاء الفواتير وتسجيل المرتجعات", False),
     ("whatsapp", "إرسال الفاتورة واتساب", True),
     ("customers", "صفحة العملاء والديون", False),
     ("debt_pay", "تسجيل دفعات الديون", False),
@@ -121,6 +122,256 @@ def normalize_phone(value):
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ------------------------------------------------------------------ سجل حركة المخزون وسجل التعديلات وتكلفة كل مورد
+def log_stock(c, item_id, delta, reason, reference="", username="", note="", qty_after=None):
+    """يسجّل كل تغيير في كمية المخزون: الكمية المضافة/المخصومة، السبب، المرجع، ومن قام بالتغيير."""
+    delta = int(round(num(delta)))
+    if not item_id or delta == 0:
+        return
+    if qty_after is None:
+        r = c.execute("SELECT qty FROM items WHERE id=?", (item_id,)).fetchone()
+        qty_after = int(num(r["qty"])) if r else 0
+    c.execute("""INSERT INTO stock_movements(ts,item_id,delta,qty_after,reason,reference,username,note)
+                 VALUES(?,?,?,?,?,?,?,?)""",
+              (now_str(), item_id, delta, int(qty_after), reason or "", str(reference or ""), username or "", note or ""))
+
+
+def log_audit(c, username, action, entity="", entity_id="", details=""):
+    """سجل التعديلات: من غيّر ماذا ومتى."""
+    c.execute("INSERT INTO audit_log(ts,username,action,entity,entity_id,details) VALUES(?,?,?,?,?,?)",
+              (now_str(), username or "", action or "", entity or "", str(entity_id or ""), details or ""))
+
+
+def record_supplier_cost(c, item_id, supplier, cost, expense=0, when=""):
+    """يحفظ تكلفة الصنف عند كل مورد على حدة (آخر سعر شراء) حتى تعرف من أي مورد وكم تشتري."""
+    supplier = clean_name(supplier)
+    if not item_id or not supplier:
+        return
+    c.execute("""INSERT INTO item_supplier_costs(item_id,supplier,cost,expense,updated_at) VALUES(?,?,?,?,?)
+                 ON CONFLICT(item_id,supplier) DO UPDATE SET
+                 cost=excluded.cost, expense=excluded.expense, updated_at=excluded.updated_at""",
+              (item_id, supplier, round(num(cost), 4), round(num(expense), 4), when or now_str()))
+
+
+def supplier_costs(c, item_id):
+    return c.execute("SELECT supplier,cost,expense,updated_at FROM item_supplier_costs WHERE item_id=? ORDER BY cost, supplier",
+                     (item_id,)).fetchall()
+
+
+def supplier_costs_text(c, item_id):
+    return " | ".join(f"{r['supplier']}: {sar(num(r['cost']) + num(r['expense']))}" for r in supplier_costs(c, item_id))
+
+
+def supplier_costs_map(c, ids):
+    """{رقم الصنف: "المورد: التكلفة | المورد الآخر: التكلفة"} لعرضها في شاشات المقارنة والدمج."""
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for r in c.execute(f"SELECT item_id,supplier,cost,expense FROM item_supplier_costs WHERE item_id IN ({marks}) ORDER BY cost",
+                           part).fetchall():
+            out.setdefault(r["item_id"], []).append(f"{r['supplier']}: {sar(num(r['cost']) + num(r['expense']))}")
+    return {k: " | ".join(v) for k, v in out.items()}
+
+
+def supplier_unit_cost(c, item_id, supplier=""):
+    """آخر تكلفة شراء للوحدة عند مورد محدد (شراء + مصاريف). بلا مورد: تكلفة الصنف الحالية."""
+    supplier = clean_name(supplier)
+    if supplier:
+        r = c.execute("SELECT cost,expense FROM item_supplier_costs WHERE item_id=? AND supplier=?",
+                      (item_id, supplier)).fetchone()
+        if r:
+            total = num(r["cost"]) + num(r["expense"])
+            if total > 0:
+                return total
+        return None
+    it = c.execute("SELECT buy,expense FROM items WHERE id=?", (item_id,)).fetchone()
+    total = (num(it["buy"]) + num(it["expense"])) if it else 0
+    return total if total > 0 else None
+
+
+def cheapest_supplier_map(c, ids):
+    """{رقم الصنف: "المورد (التكلفة)"} لأرخص مورد مسجّل لكل صنف."""
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for r in c.execute(f"SELECT item_id,supplier,cost,expense FROM item_supplier_costs WHERE item_id IN ({marks})", part).fetchall():
+            total = num(r["cost"]) + num(r["expense"])
+            if total <= 0:
+                continue
+            if r["item_id"] not in out or total < out[r["item_id"]][0]:
+                out[r["item_id"]] = (total, r["supplier"])
+    return {k: f"{v[1]} ({sar(v[0])})" for k, v in out.items()}
+
+
+def supplier_price_rows(c, item_id):
+    """أسعار كل مورد لصنف واحد: آخر فاتورة شراء لكل مورد (وإن لم تُحفظ التكلفة يُستنتج من المشتريات)."""
+    rows = c.execute("""SELECT sc.supplier, sc.cost, sc.expense, sc.updated_at,
+                        (SELECT MAX(p.date) FROM purchases p WHERE p.item_id=sc.item_id AND p.supplier=sc.supplier) last_buy,
+                        (SELECT x.code FROM item_supplier_codes x WHERE x.item_id=sc.item_id AND x.supplier=sc.supplier LIMIT 1) code,
+                        (SELECT s.phone FROM suppliers s WHERE s.name=sc.supplier) phone
+                        FROM item_supplier_costs sc WHERE sc.item_id=? ORDER BY sc.cost + sc.expense""",
+                     (item_id,)).fetchall()
+    if rows:
+        return rows
+    rows = c.execute("""SELECT p.supplier, p.buy AS cost,
+                        CASE WHEN COALESCE(p.qty,0)>0 THEN COALESCE(p.expense,0)/p.qty ELSE 0 END AS expense,
+                        p.date AS updated_at, p.date AS last_buy,
+                        (SELECT x.code FROM item_supplier_codes x WHERE x.item_id=p.item_id AND x.supplier=p.supplier LIMIT 1) code,
+                        (SELECT s.phone FROM suppliers s WHERE s.name=p.supplier) phone
+                        FROM purchases p WHERE p.item_id=? AND p.id IN
+                        (SELECT MAX(id) FROM purchases WHERE item_id=? AND COALESCE(supplier,'')<>'' GROUP BY supplier)
+                        ORDER BY p.buy""", (item_id, item_id)).fetchall()
+    if rows:
+        return rows
+    it = c.execute("SELECT supplier,buy,expense,updated_at FROM items WHERE id=?", (item_id,)).fetchone()
+    if it and clean_name(it["supplier"]) and (num(it["buy"]) + num(it["expense"])) > 0:
+        return [{"supplier": it["supplier"], "cost": it["buy"], "expense": it["expense"], "updated_at": it["updated_at"],
+                 "last_buy": "", "code": "", "phone": ""}]
+    return []
+
+
+def sale_returned_qty(c, sale_id):
+    return int(num(c.execute("SELECT COALESCE(SUM(qty),0) FROM sale_returns WHERE sale_id=?", (sale_id,)).fetchone()[0]))
+
+
+def sale_line_remaining(c, sale_id):
+    row = c.execute("SELECT qty FROM sales WHERE id=?", (sale_id,)).fetchone()
+    return max(0, int(num(row["qty"])) - sale_returned_qty(c, sale_id)) if row else 0
+
+
+def apply_sale_return(c, sale_id, qty, refund_type, reason, username):
+    """إرجاع جزئي: يعيد الكمية للمخزون ويكتب حركة مخزون وسجل تدقيق. لا يحذف أو يعدّل سطر البيع."""
+    s = c.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
+    if not s:
+        raise ValueError("سطر الفاتورة غير موجود")
+    if int(num(s["voided"])):
+        raise ValueError("هذه الفاتورة ملغاة، لا يمكن الإرجاع منها")
+    q = int(num(qty))
+    if q <= 0:
+        raise ValueError("الكمية المرتجعة يجب أن تكون أكبر من صفر")
+    remaining = int(num(s["qty"])) - sale_returned_qty(c, sale_id)
+    if q > remaining:
+        raise ValueError(f"الحد الأقصى للإرجاع من هذا السطر هو {remaining}")
+    amount = round(q * num(s["price"]), 2)
+    if (refund_type or "نقدي") == "نقدي":
+        paid_all = num(c.execute("SELECT COALESCE(SUM(paid),0) FROM sales WHERE invoice=? AND COALESCE(voided,0)=0",
+                                 (s["invoice"],)).fetchone()[0])
+        cash_ref = num(c.execute("""SELECT COALESCE(SUM(sr.amount),0) FROM sale_returns sr
+                                    JOIN sales x ON x.id=sr.sale_id
+                                    WHERE x.invoice=? AND COALESCE(x.voided,0)=0 AND sr.refund_type='نقدي'""",
+                                 (s["invoice"],)).fetchone()[0])
+        if amount > paid_all - cash_ref + 0.001:
+            raise ValueError("المدفوع في هذه الفاتورة أقل من قيمة الإرجاع النقدي.\n"
+                             "اختر (خصم من الدين) بدل (نقدي) حتى لا يطلع الصندوق بالسالب.")
+    else:
+        gross = num(c.execute("SELECT COALESCE(SUM(price*qty),0) FROM sales WHERE invoice=? AND COALESCE(voided,0)=0",
+                              (s["invoice"],)).fetchone()[0])
+        ret_all = num(c.execute("""SELECT COALESCE(SUM(sr.amount),0) FROM sale_returns sr
+                                   JOIN sales x ON x.id=sr.sale_id
+                                   WHERE x.invoice=? AND COALESCE(x.voided,0)=0""", (s["invoice"],)).fetchone()[0])
+        paid_now = num(c.execute("SELECT COALESCE(SUM(paid),0) FROM sales WHERE invoice=? AND COALESCE(voided,0)=0",
+                                 (s["invoice"],)).fetchone()[0])
+        cash_out = num(c.execute("""SELECT COALESCE(SUM(sr.amount),0) FROM sale_returns sr
+                                    JOIN sales x ON x.id=sr.sale_id
+                                    WHERE x.invoice=? AND COALESCE(x.voided,0)=0 AND sr.refund_type='نقدي'""",
+                                 (s["invoice"],)).fetchone()[0])
+        if amount > (gross - ret_all) - (paid_now - cash_out) + 0.001:
+            raise ValueError("قيمة الإرجاع أكبر من المتبقي على العميل في هذه الفاتورة.\n"
+                             "سجّل الباقي كإرجاع (نقدي) أو راجع الفاتورة.")
+    c.execute("""INSERT INTO sale_returns(sale_id,invoice,ts,qty,amount,refund_type,reason,username)
+                 VALUES(?,?,?,?,?,?,?,?)""",
+              (sale_id, s["invoice"], now_str(), q, amount, refund_type or "نقدي", reason or "", username or ""))
+    c.execute("UPDATE items SET qty=COALESCE(qty,0)+? WHERE id=?", (q, s["item_id"]))
+    log_stock(c, s["item_id"], q, "إرجاع بيع", s["invoice"], username, (refund_type or "") + " — " + (reason or ""))
+    log_audit(c, username, "إرجاع من فاتورة", "sale", sale_id,
+              f"{s['invoice']} | كمية {q} | مبلغ {amount:.2f} | {refund_type} | {reason}")
+    return amount
+
+
+def void_invoice(c, invoice, reason, username):
+    """إلغاء فاتورة كاملة: ترجع البضاعة للمخزون وتبقى الفاتورة محفوظة بعلامة (ملغاة) مع السبب ومن ألغاها."""
+    rows = c.execute("SELECT * FROM sales WHERE invoice=? AND COALESCE(voided,0)=0 ORDER BY id", (invoice,)).fetchall()
+    if not rows:
+        raise ValueError("الفاتورة غير موجودة أو ملغاة مسبقًا")
+    restocked = 0
+    for s in rows:
+        remaining = int(num(s["qty"])) - sale_returned_qty(c, s["id"])
+        if remaining > 0:
+            c.execute("UPDATE items SET qty=COALESCE(qty,0)+? WHERE id=?", (remaining, s["item_id"]))
+            log_stock(c, s["item_id"], remaining, "إلغاء فاتورة", invoice, username, reason)
+            restocked += remaining
+        c.execute("UPDATE sales SET voided=1,void_reason=?,void_by=?,void_at=? WHERE id=?",
+                  (reason, username, now_str(), s["id"]))
+    log_audit(c, username, "إلغاء فاتورة", "invoice", invoice, f"أُعيد للمخزون {restocked} قطعة | السبب: {reason}")
+    return restocked
+
+
+def _range_where(alias, d1="", d2=""):
+    where, params = [f"COALESCE({alias}.voided,0)=0"], []
+    if d1:
+        where.append(f"substr({alias}.date,1,10)>=?")
+        params.append(d1)
+    if d2:
+        where.append(f"substr({alias}.date,1,10)<=?")
+        params.append(d2)
+    return " AND ".join(where), params
+
+
+def range_totals(c, d1="", d2="", seller=""):
+    """ملخص مبيعات فترة: الإجمالي، المرتجعات، الصافي، المحصل، المرتجع النقدي، الديون المحصلة، المصروفات."""
+    where, params = _range_where("s", d1, d2)
+    if seller:
+        where += " AND s.seller=?"
+        params.append(seller)
+    row = c.execute(f"""
+        SELECT COALESCE(SUM(s.price*s.qty),0) gross, COALESCE(SUM(s.paid),0) paid,
+               COUNT(DISTINCT s.invoice) invoices, COALESCE(SUM(s.qty),0) pieces
+        FROM sales s WHERE {where}
+    """, params).fetchone()
+    ret = c.execute(f"""
+        SELECT COALESCE(SUM(sr.amount),0) amount,
+               COALESCE(SUM(CASE WHEN sr.refund_type='نقدي' THEN sr.amount ELSE 0 END),0) cash
+        FROM sale_returns sr JOIN sales s ON s.id=sr.sale_id WHERE {where}
+    """, params).fetchone()
+    debt = c.execute("""SELECT COALESCE(SUM(amount),0) FROM debt_payments
+                        WHERE (?='' OR substr(date,1,10)>=?) AND (?='' OR substr(date,1,10)<=?)""",
+                     (d1, d1, d2, d2)).fetchone()[0]
+    exp = c.execute("""SELECT COALESCE(SUM(amount),0) FROM expenses
+                       WHERE (?='' OR substr(date,1,10)>=?) AND (?='' OR substr(date,1,10)<=?)""",
+                    (d1, d1, d2, d2)).fetchone()[0]
+    voided = c.execute("""SELECT COALESCE(SUM(paid),0) FROM sales
+                          WHERE COALESCE(voided,0)=1 AND (?='' OR substr(date,1,10)>=?) AND (?='' OR substr(date,1,10)<=?)""",
+                       (d1, d1, d2, d2)).fetchone()[0]
+    gross, paid = num(row["gross"]), num(row["paid"])
+    returns, cash_ref = num(ret["amount"]), num(ret["cash"])
+    return {"gross": gross, "returns": returns, "net_sales": gross - returns,
+            "paid": paid, "cash_refunds": cash_ref, "net_collected": paid - cash_ref,
+            "debt_collected": num(debt), "expenses": num(exp), "voided_paid": num(voided),
+            "invoices": row["invoices"], "pieces": row["pieces"]}
+
+
+def total_customer_debt(c, customer_id=None):
+    """صافي ديون العملاء بعد استثناء الفواتير الملغاة والمرتجعات والدفعات اللاحقة."""
+    if customer_id:
+        base = num(c.execute("""SELECT COALESCE(SUM(CASE WHEN COALESCE(voided,0)=1 THEN 0 ELSE price*qty END),0)
+                                - COALESCE(SUM(CASE WHEN COALESCE(voided,0)=1 THEN 0 ELSE paid END),0)
+                                FROM sales WHERE customer_id=?""", (customer_id,)).fetchone()[0])
+        refund = num(c.execute("""SELECT COALESCE(SUM(sr.amount),0) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                                  WHERE COALESCE(x.voided,0)=0 AND sr.refund_type<>'نقدي' AND x.customer_id=?""",
+                               (customer_id,)).fetchone()[0])
+        later = num(c.execute("SELECT COALESCE(SUM(amount),0) FROM debt_payments WHERE customer_id=?", (customer_id,)).fetchone()[0])
+    else:
+        base = num(c.execute("""SELECT COALESCE(SUM(CASE WHEN COALESCE(voided,0)=1 THEN 0 ELSE price*qty END),0)
+                                      - COALESCE(SUM(CASE WHEN COALESCE(voided,0)=1 THEN 0 ELSE paid END),0) FROM sales""").fetchone()[0])
+        refund = num(c.execute("""SELECT COALESCE(SUM(sr.amount),0) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                                  WHERE COALESCE(x.voided,0)=0 AND sr.refund_type<>'نقدي'""").fetchone()[0])
+        later = num(c.execute("SELECT COALESCE(SUM(amount),0) FROM debt_payments").fetchone()[0])
+    return base - refund - later
 
 
 # ------------------------------------------------------------------ التحديث من GitHub Releases
@@ -331,6 +582,13 @@ def init():
         CREATE TABLE IF NOT EXISTS job_types(id INTEGER PRIMARY KEY,name TEXT UNIQUE,rate REAL DEFAULT 0,active INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS bonus_claims(id INTEGER PRIMARY KEY,employee TEXT,work_date TEXT,created_at TEXT,status TEXT DEFAULT 'pending',total REAL DEFAULT 0,note TEXT DEFAULT '',decided_by TEXT,decided_at TEXT,decision_note TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS bonus_lines(id INTEGER PRIMARY KEY,claim_id INTEGER,job_id INTEGER,job_name TEXT,cnt INTEGER,rate REAL DEFAULT 0,amount REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS stock_movements(id INTEGER PRIMARY KEY,ts TEXT,item_id INTEGER,delta INTEGER NOT NULL DEFAULT 0,qty_after INTEGER,reason TEXT DEFAULT '',reference TEXT DEFAULT '',username TEXT DEFAULT '',note TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,ts TEXT,username TEXT DEFAULT '',action TEXT DEFAULT '',entity TEXT DEFAULT '',entity_id TEXT DEFAULT '',details TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS sale_returns(id INTEGER PRIMARY KEY,sale_id INTEGER,invoice TEXT,ts TEXT,qty INTEGER DEFAULT 0,amount REAL DEFAULT 0,refund_type TEXT DEFAULT 'نقدي',reason TEXT DEFAULT '',username TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS item_supplier_costs(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,supplier TEXT NOT NULL COLLATE NOCASE,cost REAL DEFAULT 0,expense REAL DEFAULT 0,updated_at TEXT,UNIQUE(item_id,supplier));
+        CREATE INDEX IF NOT EXISTS idx_stock_mov_item ON stock_movements(item_id,id);
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(id);
+        CREATE INDEX IF NOT EXISTS idx_returns_sale ON sale_returns(sale_id);
         """)
 
         # ---- المستخدمون
@@ -343,6 +601,12 @@ def init():
 
         if "approved_by" not in cols:
             c.execute("ALTER TABLE sales ADD COLUMN approved_by TEXT")
+
+        # إلغاء الفاتورة والمرتجعات (تبقى الفاتورة محفوظة بعلامة ملغاة)
+        for col_name, col_def in (("voided", "INTEGER DEFAULT 0"), ("void_reason", "TEXT DEFAULT ''"),
+                                  ("void_by", "TEXT DEFAULT ''"), ("void_at", "TEXT DEFAULT ''")):
+            if col_name not in cols:
+                c.execute(f"ALTER TABLE sales ADD COLUMN {col_name} {col_def}")
 
         if "seller" not in cols:
             c.execute("ALTER TABLE sales ADD COLUMN seller TEXT")
@@ -429,6 +693,18 @@ def init():
 
         if "rep_code" not in item_cols:
             c.execute("ALTER TABLE items ADD COLUMN rep_code TEXT DEFAULT ''")
+
+        # من أضاف الصنف ومن عدّله آخر مرة
+        for col_name in ("created_by", "created_at", "updated_by", "updated_at"):
+            if col_name not in item_cols:
+                c.execute(f"ALTER TABLE items ADD COLUMN {col_name} TEXT DEFAULT ''")
+
+        # تعبئة تكلفة كل مورد من المشتريات السابقة (آخر سعر شراء لكل مورد)
+        if c.execute("SELECT COUNT(*) FROM item_supplier_costs").fetchone()[0] == 0:
+            for r in c.execute("""SELECT p.item_id,p.supplier,p.buy,p.expense FROM purchases p
+                                  WHERE COALESCE(p.supplier,'')<>'' AND p.id IN (
+                                  SELECT MAX(id) FROM purchases WHERE COALESCE(supplier,'')<>'' GROUP BY item_id,supplier)""").fetchall():
+                record_supplier_cost(c, r["item_id"], r["supplier"], r["buy"], r["expense"])
 
         # الأصل: أصلي / صيني
         if "origin" not in item_cols:
@@ -878,7 +1154,10 @@ def customer_suggestions(c, text, limit=8):
     like_phone = "%" + digits + "%" if len(digits) >= 3 else None
     return c.execute("""
         SELECT cu.id, cu.name, cu.phone,
-        COALESCE((SELECT SUM(s.price*s.qty-COALESCE(s.paid,0)) FROM sales s WHERE s.customer_id=cu.id),0)
+        COALESCE((SELECT SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.price*s.qty-COALESCE(s.paid,0) END)
+                  FROM sales s WHERE s.customer_id=cu.id),0)
+        -COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                   WHERE x.customer_id=cu.id AND COALESCE(x.voided,0)=0 AND sr.refund_type<>'نقدي'),0)
         -COALESCE((SELECT SUM(dp.amount) FROM debt_payments dp WHERE dp.customer_id=cu.id),0) AS debt
         FROM customers cu
         WHERE cu.name LIKE ? OR (? IS NOT NULL AND cu.phone LIKE ?)
@@ -1026,9 +1305,10 @@ def _named_codes(c, ids):
     return out
 
 
-def _item_brief(r, codes=""):
+def _item_brief(r, codes="", supplier_info=""):
     return {"id": r["id"], "item_no": r["item_no"], "part": r["part"] or "", "rep_code": r["rep_code"] or "", "codes": codes,
-            "name": item_display_name(r), "qty": r["qty"] or 0, "origin": r["origin"] or ""}
+            "name": item_display_name(r), "qty": r["qty"] or 0, "origin": r["origin"] or "",
+            "supplier_info": supplier_info}
 
 
 def codes_label(b):
@@ -1062,13 +1342,14 @@ def find_similar_items(c, cand, exclude_id=None, limit=5, threshold=65):
     ids = list(pool)
     extra = _extra_codes(c, ids)
     named = _named_codes(c, ids)
+    scmap = supplier_costs_map(c, ids)
     out = []
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
         for r in c.execute(f"SELECT * FROM items WHERE id IN ({','.join('?' * len(part))})", part).fetchall():
             sc, why = similarity(cand, _item_profile(r, extra.get(r["id"], set())))
             if sc >= threshold:
-                out.append(dict(_item_brief(r, " / ".join(named.get(r["id"], []))), score=sc, reasons=why))
+                out.append(dict(_item_brief(r, " / ".join(named.get(r["id"], [])), scmap.get(r["id"], "")), score=sc, reasons=why))
     out.sort(key=lambda x: -x["score"])
     return out[:limit]
 
@@ -1079,6 +1360,7 @@ def find_duplicate_pairs(c, threshold=65, limit=300):
     by_id = {r["id"]: r for r in rows}
     extra = _extra_codes(c, by_id.keys())
     named = _named_codes(c, by_id.keys())
+    scmap = supplier_costs_map(c, by_id.keys())
     ignored = {(r[0], r[1]) for r in c.execute("SELECT a_id,b_id FROM dup_ignored").fetchall()}
     profiles = {i: _item_profile(r, extra.get(i, set())) for i, r in by_id.items()}
     pairs = {}
@@ -1108,15 +1390,17 @@ def find_duplicate_pairs(c, threshold=65, limit=300):
         for x in range(len(ids)):
             for y in range(x + 1, len(ids)):
                 add(ids[x], ids[y])
-    out = [{"a": _item_brief(by_id[a], " / ".join(named.get(a, []))), "b": _item_brief(by_id[b], " / ".join(named.get(b, []))), "score": sc, "reasons": why}
+    out = [{"a": _item_brief(by_id[a], " / ".join(named.get(a, [])), scmap.get(a, "")),
+            "b": _item_brief(by_id[b], " / ".join(named.get(b, [])), scmap.get(b, "")),
+            "score": sc, "reasons": why}
            for (a, b), (sc, why) in pairs.items()]
     out.sort(key=lambda p: -p["score"])
     return out[:limit]
 
 
-def merge_items(c, keep_id, drop_id):
-    """يدمج صنفًا مكررًا (drop) في الصنف المُبقى (keep): الكمية تُجمع والتكلفة بالمتوسط المرجّح،
-    وكل المشتريات والمبيعات والطلبات تنتقل، ورموز الصنف المحذوف تبقى رموزًا بديلة."""
+def merge_items(c, keep_id, drop_id, username=""):
+    """يدمج صنفًا مكررًا (drop) في الصنف المُبقى (keep): الكمية تُجمع، وكل المشتريات والمبيعات تنتقل،
+    وتبقى أسماء الموردين وتكلفة الشراء عند كل مورد محفوظة (حتى تعرف من أي مورد وكم تشتري)."""
     if keep_id == drop_id:
         raise ValueError("اختر صنفين مختلفين")
     keep = c.execute("SELECT * FROM items WHERE id=?", (keep_id,)).fetchone()
@@ -1135,10 +1419,25 @@ def merge_items(c, keep_id, drop_id):
     retail = num(keep["retail"]) if num(keep["retail"]) > 0 else num(drop["retail"])
     image = keep["image"] or drop["image"]
     min_qty = keep["min_qty"] if keep["min_qty"] is not None else drop["min_qty"]
+
+    # أسماء الموردين: من الصنفين ومن كل فواتير الشراء المرتبطة بهما
+    sup_names = []
+    for name_ in (keep["supplier"], drop["supplier"]):
+        name_ = clean_name(name_)
+        if name_ and name_ not in sup_names:
+            sup_names.append(name_)
+    for r in c.execute("""SELECT DISTINCT supplier FROM purchases
+                          WHERE item_id IN (?,?) AND COALESCE(supplier,'')<>'' ORDER BY supplier""", (keep_id, drop_id)).fetchall():
+        if r["supplier"] not in sup_names:
+            sup_names.append(r["supplier"])
+    cost_rows = c.execute("SELECT supplier,cost,expense,updated_at FROM item_supplier_costs WHERE item_id IN (?,?)",
+                          (keep_id, drop_id)).fetchall()
+
     c.execute("""UPDATE items SET qty=?, buy=?, expense=?, profit=?, retail=?, image=?, min_qty=?,
-                 supplier=COALESCE(NULLIF(supplier,''),?), rep_code=COALESCE(NULLIF(rep_code,''),?), incomplete=? WHERE id=?""",
+                 supplier=?, rep_code=COALESCE(NULLIF(rep_code,''),?), incomplete=?, updated_by=?, updated_at=? WHERE id=?""",
               (q1 + q2, round(nb, 4), round(ne, 4), profit, retail, image or "", min_qty,
-               drop["supplier"] or "", drop["rep_code"] or "", 0 if (nb + ne) > 0 else 1, keep_id))
+               " / ".join(sup_names), drop["rep_code"] or "", 0 if (nb + ne) > 0 else 1,
+               username, now_str(), keep_id))
     for tbl in ("purchases", "sales", "po_lines", "bundle_items"):
         c.execute(f"UPDATE {tbl} SET item_id=? WHERE item_id=?", (keep_id, drop_id))
     aliases = [("", cd) for cd in (drop["part"], drop["rep_code"], drop["item_no"]) if cd]
@@ -1148,11 +1447,20 @@ def merge_items(c, keep_id, drop_id):
         c.execute("INSERT OR IGNORE INTO item_aliases(item_id,supplier,code) VALUES(?,?,?)", (keep_id, sup, cd))
     for r in c.execute("SELECT supplier, code FROM item_supplier_codes WHERE item_id=?", (drop_id,)).fetchall():
         c.execute("INSERT OR IGNORE INTO item_supplier_codes(item_id,supplier,code) VALUES(?,?,?)", (keep_id, r["supplier"], r["code"]))
-    for tbl in ("item_supplier_codes", "item_aliases"):
+    # تكلفة كل مورد تبقى كما هي عند الصنف المُبقى
+    for r in cost_rows:
+        record_supplier_cost(c, keep_id, r["supplier"], r["cost"], r["expense"], when=r["updated_at"])
+    for it, b_, e_ in ((keep, b1, e1), (drop, b2, e2)):
+        if b_ > 0 and clean_name(it["supplier"]):
+            record_supplier_cost(c, keep_id, it["supplier"], b_, e_)
+    for tbl in ("item_supplier_codes", "item_aliases", "item_supplier_costs"):
         c.execute(f"DELETE FROM {tbl} WHERE item_id=?", (drop_id,))
     c.execute("DELETE FROM stock_alerts WHERE item_id=?", (drop_id,))
     c.execute("DELETE FROM dup_ignored WHERE a_id=? OR b_id=?", (drop_id, drop_id))
     c.execute("DELETE FROM items WHERE id=?", (drop_id,))
+    log_stock(c, keep_id, q2, "دمج صنفين", drop["item_no"], username, f"دُمج الصنف {drop['item_no']} في {keep['item_no']}")
+    log_audit(c, username, "دمج أصناف مكررة", "item", keep_id,
+              f"أُبقي {keep['item_no']} وحُذف {drop['item_no']} | الكمية {q1} + {q2} | الموردون: {' / '.join(sup_names) or '—'}")
     return {"qty": q1 + q2, "delete_image": drop["image"] if (drop["image"] and drop["image"] != image) else ""}
 
 
@@ -1878,6 +2186,7 @@ class App(tk.Tk):
             ("expenses", "💸  المصروفات", self.expenses, self.can("expenses")),
             ("bonus", "🎯  البونص والأعمال", self.bonus_page_admin if is_admin else self.bonus_page_emp, is_admin or self.can("bonus")),
             ("reports", "📊  التقارير", self.reports, self.can("reports")),
+            ("logs", "📜  سجل الحركة والتعديلات", self.logs_page, is_admin or self.can("inv_edit")),
             ("users", "🔐  المستخدمون والصلاحيات", self.users_page, is_admin),
             ("settings", "⚙  الإعدادات", self.settings, is_admin),
         ]
@@ -1965,8 +2274,8 @@ class App(tk.Tk):
         if sub:
             ttk.Label(f, text=sub, style="Sub.TLabel").pack(anchor="e")
 
-    def table(self, cols, heads, rows, widths=None):
-        t = make_tree(self.body, cols, heads, widths)
+    def table(self, cols, heads, rows, widths=None, parent=None):
+        t = make_tree(parent or self.body, cols, heads, widths)
         for row in rows:
             add_row(t, row)
         return t
@@ -1978,8 +2287,8 @@ class App(tk.Tk):
         tk.Label(f, text=title, bg="white", fg=MUTED, font=(FONT, 10)).pack(anchor="e", padx=18, pady=(0, 14))
         return f
 
-    def card_grid(self, cards, per_row=4):
-        grid = ttk.Frame(self.body)
+    def card_grid(self, cards, per_row=4, parent=None):
+        grid = ttk.Frame(parent or self.body)
         grid.pack(fill="x", pady=6)
         for i in range(per_row):
             grid.columnconfigure(i, weight=1, uniform="cards")
@@ -2001,8 +2310,8 @@ class App(tk.Tk):
             mine = c.execute("SELECT COUNT(DISTINCT invoice) FROM sales WHERE seller=? AND date LIKE ?", (self.user, today + "%")).fetchone()[0]
             cards += [("عدد الأصناف", items_n, ACCENT), ("إجمالي القطع في المخزون", qty_total, ACCENT), ("منخفضة المخزون (1-5)", low, AMBER), ("نفدت من المخزون", out, RED), ("فواتيري اليوم", mine, GREEN)]
             if self.can("reports"):
-                day_total = c.execute("SELECT COALESCE(SUM(price*qty),0) FROM sales WHERE date LIKE ?", (today + "%",)).fetchone()[0]
-                debts = c.execute("SELECT COALESCE((SELECT SUM(price*qty-COALESCE(paid,0)) FROM sales),0)-COALESCE((SELECT SUM(amount) FROM debt_payments),0)").fetchone()[0]
+                day_total = range_totals(c, today, today)["net_sales"]
+                debts = total_customer_debt(c)
                 cards += [("مبيعات اليوم", sar(day_total), GREEN), ("صافي ديون العملاء", sar(debts), RED)]
             if self.can("view_cost"):
                 inc = c.execute("SELECT COUNT(*) FROM items WHERE incomplete=1").fetchone()[0]
@@ -2257,6 +2566,9 @@ class App(tk.Tk):
             ttk.Button(row2, text="📤 النواقص ← مسؤول المشتريات", style="Success.TButton", command=lambda: self.shortage_window(sup.get() if sup.get() != "الكل" else None)).pack(side="left", padx=4)
         if self.can("view_cost") or self.can("purchases"):
             ttk.Button(row2, text="📉 سجل أسعار الشراء", command=lambda: self.price_history(int(t.selection()[0]) if t.selection() else None)).pack(side="left", padx=4)
+        if self.role == "admin" or self.can("inv_edit"):
+            ttk.Button(row2, text="📜 سجل حركة الصنف",
+                       command=lambda: self.stock_log_window(int(t.selection()[0]) if t.selection() else None)).pack(side="left", padx=4)
 
         def load():
             bm = parse_barcode(q.get())
@@ -2596,6 +2908,21 @@ class App(tk.Tk):
         notes = entry(val("notes"))
         line("ملاحظات", notes)
 
+        if editing:
+            info = ttk.LabelFrame(frame, text="آخر تعديل وموردو الصنف (تكلفة كل مورد)", padding=8)
+            info.grid(row=counter[0], column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 4))
+            counter[0] += 1
+            ttk.Label(info, text=f"آخر تعديل: {val('updated_by') or '—'}   —   {val('updated_at') or '—'}",
+                      foreground=MUTED).pack(anchor="e")
+            with connect() as c_:
+                scrows = supplier_costs(c_, row["id"])
+            if scrows:
+                for sc in scrows:
+                    ttk.Label(info, text=f"• {sc['supplier']}: تكلفة {sar(num(sc['cost']) + num(sc['expense']))}   (آخر شراء: {sc['updated_at'] or '—'})").pack(anchor="e")
+            else:
+                ttk.Label(info, text="لا توجد مشتريات مسجلة بعد — تُحفظ تكلفة كل مورد تلقائيًا عند استلام فاتورة الشراء.",
+                          foreground=MUTED).pack(anchor="e")
+
         def save():
             d = {
                 "item_no": item_no.get().strip(), "part": part.get().strip(),
@@ -2624,8 +2951,25 @@ class App(tk.Tk):
                 cand["img_hash"] = image_dhash(img["src"]) if img["src"] else None
                 with connect() as c_:
                     sims = find_similar_items(c_, cand)
-                if sims and self._similar_dialog(win, sims, f"{d['part']} — {d['make']} {d['model']}", mode="add", left=self._form_compare_data(d, img["src"])) is None:
-                    return
+                if sims:
+                    res = self._similar_dialog(win, sims, f"{d['part']} — {d['make']} {d['model']}",
+                                               mode=("edit" if editing else "add"),
+                                               left=self._form_compare_data(d, img["src"]))
+                    if res is None:
+                        return
+                    if res[0] == "link" and not editing:
+                        try:
+                            same_id = self._add_qty_to_existing(res[1], d)
+                        except Exception as e:
+                            messagebox.showerror("خطأ", str(e), parent=win)
+                            return
+                        win.destroy()
+                        if on_saved and same_id:
+                            on_saved(same_id)
+                            return
+                        messagebox.showinfo("تم", "تمت إضافة الكمية والتكلفة للصنف الموجود بدل إنشاء صنف مكرر.")
+                        self.inventory()
+                        return
             new_id = None
             try:
                 if editing:
@@ -2650,6 +2994,39 @@ class App(tk.Tk):
         if not self.can("inv_add"):
             return
         self.item_dialog()
+
+    def _add_qty_to_existing(self, item_id, d):
+        """عند إضافة صنف مشابه: تضيف الكمية والتكلفة للصنف الموجود بدل إنشاء صنف مكرر (ويُحفظ من عدّله)."""
+        qty = int(num(d["qty"]))
+        if qty < 0:
+            raise ValueError("الكمية لا يمكن أن تكون سالبة")
+        with connect() as c:
+            it = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if not it:
+                raise ValueError("الصنف غير موجود")
+            if self.can("view_cost") and num(d["buy"]) > 0:
+                q0 = max(int(it["qty"] or 0), 0)
+                b0, e0 = num(it["buy"]), num(it["expense"])
+                b1 = num(d["buy"])
+                e1 = round(b1 * num(d["expense"]) / 100.0, 4)
+                if q0 > 0 and (b0 + e0) > 0:
+                    nb = (q0 * b0 + qty * b1) / (q0 + qty)
+                    ne = (q0 * e0 + qty * e1) / (q0 + qty)
+                else:
+                    nb, ne = b1, e1
+                c.execute("UPDATE items SET qty=COALESCE(qty,0)+?,buy=?,expense=?,incomplete=0 WHERE id=?",
+                          (qty, round(nb, 4), round(ne, 4), item_id))
+            else:
+                c.execute("UPDATE items SET qty=COALESCE(qty,0)+? WHERE id=?", (qty, item_id))
+            retail = num(d.get("retail"))
+            if retail > 0 and num(it["retail"]) <= 0:
+                c.execute("UPDATE items SET retail=? WHERE id=?", (retail, item_id))
+            c.execute("UPDATE items SET updated_by=?,updated_at=? WHERE id=?", (self.user, now_str(), item_id))
+            log_stock(c, item_id, qty, "إضافة كمية لصنف موجود", it["item_no"], self.user,
+                      f"عند إضافة صنف مشابه — {d['part'].strip()}")
+            log_audit(c, self.user, "دمج عند الإضافة", "item", item_id,
+                      f"{it['item_no']} | كمية +{qty} | {d['part'].strip()}")
+        return item_id
 
     def _save_item(self, d):
         if not d["part"].strip() or not d["qty"].strip():
@@ -2694,6 +3071,11 @@ class App(tk.Tk):
             if d.get("min_qty") is not None:
                 mq = str(d["min_qty"]).strip()
                 c.execute("UPDATE items SET min_qty=? WHERE id=?", (None if mq == "" else max(0, int(num(mq))), cur.lastrowid))
+            stamp = now_str()
+            c.execute("UPDATE items SET created_by=?,created_at=?,updated_by=?,updated_at=? WHERE id=?",
+                      (self.user, stamp, self.user, stamp, cur.lastrowid))
+            log_stock(c, cur.lastrowid, qty, "رصيد افتتاحي", item_no, self.user)
+            log_audit(c, self.user, "إضافة صنف", "item", cur.lastrowid, f"{item_no} | {d['part'].strip()} | {car} | كمية {qty}")
             return cur.lastrowid
 
     def edit_item(self, table):
@@ -2730,6 +3112,7 @@ class App(tk.Tk):
             raise ValueError("اختر الشركة والموديل من القائمة")
 
         with connect() as c:
+            old = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             item_no = d["item_no"].strip() or next_item_no(c, state)
             if c.execute("SELECT 1 FROM items WHERE item_no=? AND id<>?", (item_no, item_id)).fetchone():
                 raise ValueError("رقم الصنف موجود مسبقًا")
@@ -2761,6 +3144,33 @@ class App(tk.Tk):
             elif d.get("image_remove") and old_img:
                 c.execute("UPDATE items SET image='' WHERE id=?", (item_id,))
                 delete_image(old_img)
+
+            old_qty = int(num(old["qty"])) if old else 0
+            if old and qty != old_qty:
+                log_stock(c, item_id, qty - old_qty, "تعديل يدوي للكمية", item_no, self.user,
+                          f"من {old_qty} إلى {qty}" + (f" — {d['notes']}" if d.get("notes") else ""))
+            changes = []
+
+            def changed(label, was, now):
+                if str(was if was is not None else "") != str(now if now is not None else ""):
+                    changes.append(f"{label}: {was if was not in (None, '') else '-'} ← {now if now not in (None, '') else '-'}")
+
+            if old:
+                changed("رقم القطعة", old["part"], d["part"].strip())
+                changed("السيارة", old["car"], car)
+                changed("نوع القطعة", old["category"], d["category"])
+                changed("نوع المفتاح", old["kind"], d["kind"])
+                changed("الموقع", old["location"], d["location"])
+                changed("سعر المفرد", num(old["retail"]), num(d["retail"]))
+                changed("الكمية", old_qty, qty)
+                changed("الحالة", old["condition"], state)
+                if self.can("view_cost"):
+                    changed("سعر الشراء", num(old["buy"]), num(d["buy"]))
+                    changed("المصاريف", num(old["expense"]), round(num(d["buy"]) * num(d["expense"]) / 100.0, 4))
+                    changed("الربح %", num(old["profit"]), num(d["profit"]))
+                c.execute("UPDATE items SET updated_by=?,updated_at=? WHERE id=?", (self.user, now_str(), item_id))
+                log_audit(c, self.user, "تعديل صنف", "item", item_id,
+                          f"{item_no} | " + (" | ".join(changes) if changes else "حفظ بدون تغيير في القيم"))
 
     def print_barcode(self, table):
         """طباعة الباركود من المخزون: حدد صنفًا أو أكثر، واكتب عدد الملصقات لكل صنف."""
@@ -2951,28 +3361,52 @@ class App(tk.Tk):
         q = ttk.Entry(row, width=28, justify="right")
         q.pack(side="right")
         ttk.Button(row, text="＋ فاتورة جديدة", style="Accent.TButton", command=self.new_sale).pack(side="left", padx=4)
-        cols = ("id", "invoice", "date", "customer", "phone", "type", "total", "paid", "remaining")
-        heads = {"id": "رقم", "invoice": "رقم الفاتورة", "date": "التاريخ", "customer": "العميل", "phone": "الجوال", "type": "الدفع", "total": "الإجمالي", "paid": "المدفوع", "remaining": "المتبقي"}
-        t = make_tree(self.body, cols, heads, {"id": 60, "invoice": 150, "date": 150})
+        cols = ("id", "invoice", "date", "customer", "phone", "type", "total", "paid", "remaining", "status")
+        heads = {"id": "رقم", "invoice": "رقم الفاتورة", "date": "التاريخ", "customer": "العميل", "phone": "الجوال", "type": "الدفع",
+                 "total": "الإجمالي (بعد المرتجع)", "paid": "المدفوع", "remaining": "المتبقي", "status": "الحالة"}
+        t = make_tree(self.body, cols, heads, {"id": 60, "invoice": 150, "date": 150, "status": 150})
         if self.can("whatsapp"):
             ttk.Button(row, text="إرسال واتساب", command=lambda: self._wa_selected(t)).pack(side="left", padx=4)
+        if self.can("returns"):
+            ttk.Button(row, text="↩ إرجاع / إلغاء فاتورة", style="Danger.TButton",
+                       command=lambda: self.invoice_actions(t)).pack(side="left", padx=4)
         own = "" if self.can("sales_all") else self.user
 
         def load():
             term = "%" + q.get().strip() + "%"
             with connect() as c:
                 rows = c.execute("""
-                    SELECT invoice,MIN(id) id,MAX(date) date,MAX(customer) customer,
-                    MAX(customer_phone) phone,MAX(payment_type) ptype,SUM(price*qty) total,COALESCE(SUM(paid),0) paid,
-                    SUM(price*qty)-COALESCE(SUM(paid),0) remaining
-                    FROM sales
-                    WHERE (CAST(invoice AS TEXT) LIKE ? OR customer LIKE ? OR customer_phone LIKE ?)
-                    AND (?='' OR seller=?)
-                    GROUP BY invoice ORDER BY MIN(id) DESC
+                    SELECT s.invoice,MIN(s.id) id,MAX(s.date) date,MAX(s.customer) customer,
+                    MAX(s.customer_phone) phone,MAX(s.payment_type) ptype,
+                    SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.price*s.qty END) gross,
+                    COALESCE(SUM(s.paid),0) paid_all,
+                    COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                              WHERE x.invoice=s.invoice AND COALESCE(x.voided,0)=0),0) refunds,
+                    COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                              WHERE x.invoice=s.invoice AND COALESCE(x.voided,0)=0 AND sr.refund_type='نقدي'),0) cash_refunds,
+                    MAX(COALESCE(s.voided,0)) voided, MAX(COALESCE(s.void_reason,'')) vreason
+                    FROM sales s
+                    WHERE (CAST(s.invoice AS TEXT) LIKE ? OR s.customer LIKE ? OR s.customer_phone LIKE ?)
+                    AND (?='' OR s.seller=?)
+                    GROUP BY s.invoice ORDER BY MIN(s.id) DESC
                 """, (term, term, term, own, own)).fetchall()
             clear_tree(t)
             for r in rows:
-                add_row(t, (r["id"], r["invoice"], r["date"], r["customer"], r["phone"], r["ptype"] or "", sar(r["total"]), sar(r["paid"]), sar(r["remaining"])), iid=str(r["invoice"]))
+                refunds = num(r["refunds"])
+                if int(num(r["voided"])):
+                    total = paid = remaining = 0.0
+                    status = "🚫 ملغاة"
+                    extra = ("out",)
+                else:
+                    total = num(r["gross"]) - refunds
+                    paid = num(r["paid_all"]) - num(r["cash_refunds"])
+                    remaining = total - paid
+                    status = "✅ مكتملة" if remaining <= 0.009 else "⏳ دين"
+                    if refunds > 0:
+                        status += " (مرتجع)"
+                    extra = ("low",) if remaining > 0.009 else ()
+                add_row(t, (r["id"], r["invoice"], r["date"], r["customer"], r["phone"], r["ptype"] or "",
+                            sar(total), sar(paid), sar(remaining), status), iid=str(r["invoice"]), extra=extra)
 
         ttk.Button(row, text="🔍 بحث", command=load).pack(side="left")
         q.bind("<Return>", lambda e: load())
@@ -3056,6 +3490,11 @@ class App(tk.Tk):
         return "\n".join(out), (first["customer_phone"] or "")
 
     def send_invoice_whatsapp(self, invoice_no, parent=None):
+        with connect() as c_:
+            v = c_.execute("SELECT COUNT(*) FROM sales WHERE invoice=? AND COALESCE(voided,0)=1", (invoice_no,)).fetchone()[0]
+        if v:
+            messagebox.showwarning("تنبيه", "هذه الفاتورة ملغاة — لا تُرسل للعميل.", parent=parent or self)
+            return
         if not self.can("whatsapp"):
             return
         text, phone = self.invoice_text(invoice_no)
@@ -3325,10 +3764,12 @@ class App(tk.Tk):
                     messagebox.showwarning("تنبيه", "في الدين لازم يكون المدفوع أقل من إجمالي الفاتورة. إذا دفع كامل المبلغ اختر كاش")
                     return
 
+            below = []
             for x in invoice_items:
                 r = x["item"]
                 mp = min_price_of(r, x["kind"])
                 if x["price"] < mp:
+                    below.append(f"{r['part']} ({sar(x['price'])} < {sar(mp)})")
                     if not self.can("below_price"):
                         messagebox.showwarning("السعر منخفض", "لا يمكن إصدار الفاتورة بسعر أقل من الحد المسموح. الفاتورة ما زالت مفتوحة.")
                         return
@@ -3351,6 +3792,8 @@ class App(tk.Tk):
                     if cust and customer_phone:
                         c.execute("UPDATE customers SET phone=? WHERE id=? AND (phone IS NULL OR phone='')", (customer_phone, customer_id))
                 rows_out = expand_invoice_lines(c, invoice_items, invoice_no)
+                if below:
+                    log_audit(c, self.user, "بيع بأقل من الحد المسموح", "invoice", invoice_no, " | ".join(below))
                 remaining_paid = paid_now
                 for ro in rows_out:
                     line_total = ro["qty"] * ro["price"]
@@ -3370,6 +3813,8 @@ class App(tk.Tk):
                         ro["bundle_name"], ro["bundle_qty"], ro["bundle_group"]
                     ))
                     c.execute("UPDATE items SET qty=qty-? WHERE id=?", (ro["qty"], ro["item_id"]))
+                    log_stock(c, ro["item_id"], -int(num(ro["qty"])), "بيع", invoice_no, self.user,
+                              ro["bundle_name"] or "")
 
             if self.can("whatsapp") and messagebox.askyesno("واتساب", f"تم إصدار الفاتورة رقم {invoice_no}\n\nهل تريد إرسالها للعميل عبر واتساب؟"):
                 self.send_invoice_whatsapp(invoice_no)
@@ -3384,33 +3829,190 @@ class App(tk.Tk):
         selected = table.selection()
         if not selected:
             return
-        invoice_no = table.item(selected[0], "values")[1]
+        self.invoice_window(table.item(selected[0], "values")[1])
+
+    def invoice_actions(self, table):
+        selected = table.selection()
+        if not selected:
+            messagebox.showwarning("تنبيه", "حدد الفاتورة أولًا")
+            return
+        self.invoice_window(table.item(selected[0], "values")[1])
+
+    def invoice_window(self, invoice_no):
         with connect() as c:
             rows = c.execute("""
                 SELECT s.*,i.item_no,i.part,i.car,i.condition
                 FROM sales s LEFT JOIN items i ON i.id=s.item_id
                 WHERE s.invoice=? ORDER BY s.id
             """, (invoice_no,)).fetchall()
+            ret_rows = c.execute("""SELECT sr.*,i.item_no,i.part FROM sale_returns sr
+                                    JOIN sales x ON x.id=sr.sale_id LEFT JOIN items i ON i.id=x.item_id
+                                    WHERE x.invoice=? ORDER BY sr.id""", (invoice_no,)).fetchall()
+            returned = {}
+            for r in rows:
+                returned[r["id"]] = sale_returned_qty(c, r["id"])
+        if not rows:
+            messagebox.showwarning("تنبيه", "الفاتورة غير موجودة")
+            return
         win = tk.Toplevel(self)
         win.title("تفاصيل الفاتورة " + str(invoice_no))
         win.configure(bg=BG)
-        win.geometry("880x500")
-        ttk.Label(win, text=f"فاتورة رقم {invoice_no}", style="Title.TLabel").pack(pady=8)
-        if rows:
-            first = rows[0]
-            ttk.Label(win, text=f"العميل: {first['customer']}    الجوال: {first['customer_phone'] or ''}    الدفع: {first['payment_type'] or ''}").pack()
-        cols = ("item_no", "part", "car", "qty", "kind", "price", "total")
-        heads = {"item_no": "رقم الصنف", "part": "رقم القطعة", "car": "السيارة", "qty": "الكمية", "kind": "البيع", "price": "السعر", "total": "الإجمالي"}
-        t = make_tree(win, cols, heads)
-        total = 0
-        paid = sum(num(r["paid"]) for r in rows)
+        win.geometry("1000x680")
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(side="bottom", fill="x")
+        first = rows[0]
+        voided = int(num(first["voided"]))
+        ttk.Label(body, text=f"فاتورة رقم {invoice_no}", style="Title.TLabel").pack(anchor="e")
+        if voided:
+            ttk.Label(body, text=f"🚫 ملغاة بواسطة {first['void_by'] or '—'} — {first['void_at'] or ''}\nالسبب: {first['void_reason'] or ''}",
+                      foreground=RED, font=(FONT, 10, "bold"), justify="right").pack(anchor="e")
+        else:
+            ttk.Label(body, text="✅ فاتورة سارية", foreground=GREEN, font=(FONT, 10, "bold")).pack(anchor="e")
+        ttk.Label(body, text=f"العميل: {first['customer']}    الجوال: {first['customer_phone'] or ''}    الدفع: {first['payment_type'] or ''}    التاريخ: {first['date']}").pack(anchor="e")
+
+        cols = ("item_no", "part", "car", "qty", "returned", "remaining", "kind", "price", "total")
+        heads = {"item_no": "رقم الصنف", "part": "رقم القطعة", "car": "السيارة", "qty": "الكمية", "returned": "المرتجع",
+                 "remaining": "المتبقي", "kind": "البيع", "price": "السعر", "total": "الإجمالي"}
+        t = make_tree(body, cols, heads, {"item_no": 105, "part": 120, "car": 150, "qty": 65, "returned": 65, "remaining": 65, "kind": 80, "price": 95, "total": 105})
+        gross = paid_all = 0.0
         for r in rows:
-            line_total = r["qty"] * r["price"]
-            total += line_total
-            add_row(t, (r["item_no"], r["part"], (r["car"] or "") + (f"  ← ضمن 🎁 {r['bundle_name']}" if r["bundle_name"] else ""), r["qty"], r["kind"], sar(r["price"]), sar(line_total)))
-        ttk.Label(win, text=f"الإجمالي: {sar(total)}    المدفوع: {sar(paid)}    المتبقي: {sar(total - paid)}", font=(FONT, 12, "bold")).pack(pady=4)
-        if self.can("whatsapp"):
-            ttk.Button(win, text="إرسال واتساب", style="Success.TButton", command=lambda: self.send_invoice_whatsapp(invoice_no, parent=win)).pack(pady=8)
+            line_total = num(r["qty"]) * num(r["price"])
+            gross += line_total
+            paid_all += num(r["paid"])
+            add_row(t, (r["item_no"], r["part"], (r["car"] or "") + (f"  ← ضمن 🎁 {r['bundle_name']}" if r["bundle_name"] else ""),
+                        r["qty"], returned[r["id"]], max(0, int(num(r["qty"])) - returned[r["id"]]),
+                        r["kind"], sar(r["price"]), sar(line_total)))
+        ret_total = sum(num(x["amount"]) for x in ret_rows)
+        cash_ref = sum(num(x["amount"]) for x in ret_rows if x["refund_type"] == "نقدي")
+        total = gross - ret_total
+        paid = paid_all - cash_ref
+        if voided:
+            total = paid = 0.0
+        ttk.Label(body, text=f"الإجمالي: {sar(gross)}    المرتجعات: {sar(ret_total)}    الصافي: {sar(total)}    "
+                             f"المدفوع: {sar(paid)}    المتبقي: {sar(max(0, total - paid))}",
+                  font=(FONT, 12, "bold")).pack(pady=4)
+        if ret_rows:
+            ttk.Label(body, text="سجل المرتجعات", font=(FONT, 11, "bold")).pack(anchor="e", pady=(8, 0))
+            rt = make_tree(body, ("ts", "item", "qty", "amount", "type", "reason", "user"),
+                           {"ts": "التاريخ", "item": "الصنف", "qty": "الكمية", "amount": "المبلغ", "type": "طريقة التسوية",
+                            "reason": "السبب", "user": "بواسطة"}, height=min(max(len(ret_rows), 2), 5))
+            for x in ret_rows:
+                add_row(rt, (x["ts"], f"{x['item_no'] or ''} | {x['part'] or ''}", x["qty"], sar(x["amount"]),
+                             x["refund_type"], x["reason"], x["username"]))
+        if not voided and self.can("returns"):
+            ttk.Button(bar, text="↩ إرجاع صنف / أصناف", style="Accent.TButton",
+                       command=lambda: self.invoice_return_dialog(invoice_no, win)).pack(side="right", padx=4)
+            ttk.Button(bar, text="🚫 إلغاء الفاتورة", style="Danger.TButton",
+                       command=lambda: self.invoice_void_dialog(invoice_no, win)).pack(side="right", padx=4)
+        if self.can("whatsapp") and not voided:
+            ttk.Button(bar, text="إرسال واتساب", style="Success.TButton",
+                       command=lambda: self.send_invoice_whatsapp(invoice_no, parent=win)).pack(side="right", padx=4)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+
+    def invoice_return_dialog(self, invoice_no, parent=None):
+        if not self.can("returns"):
+            return
+        with connect() as c:
+            lines = c.execute("""SELECT s.*,i.item_no,i.part FROM sales s LEFT JOIN items i ON i.id=s.item_id
+                                 WHERE s.invoice=? AND COALESCE(s.voided,0)=0 ORDER BY s.id""", (invoice_no,)).fetchall()
+            rows = [(s, int(num(s["qty"])) - sale_returned_qty(c, s["id"])) for s in lines]
+        if not rows or all(rem <= 0 for _, rem in rows):
+            messagebox.showinfo("الإرجاع", "كل أصناف هذه الفاتورة مرتجعة أو لا يمكن الإرجاع منها.", parent=parent or self)
+            return
+        dlg = tk.Toplevel(parent or self)
+        dlg.title("إرجاع من الفاتورة " + str(invoice_no))
+        dlg.configure(bg=BG)
+        dlg.transient(parent or self)
+        dlg.grab_set()
+        fr = ttk.Frame(dlg, padding=14)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(fr, text=f"إرجاع جزئي — فاتورة {invoice_no}", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(fr, text="حدد السطر، اكتب الكمية المرتجعة، واختر طريقة التسوية. ترجع الكمية للمخزون فورًا.",
+                  style="Sub.TLabel").pack(anchor="e")
+        tcols = ("item_no", "part", "sold", "returned", "remaining", "price")
+        t = make_tree(fr, tcols, {"item_no": "رقم الصنف", "part": "رقم القطعة", "sold": "المباع", "returned": "المرتجع",
+                                  "remaining": "المتبقي", "price": "سعر الوحدة"}, {"item_no": 110, "part": 130, "sold": 70, "returned": 70, "remaining": 70, "price": 95})
+        for s, rem in rows:
+            add_row(t, (s["item_no"], s["part"], s["qty"], int(num(s["qty"])) - rem, rem, sar(s["price"])), iid=str(s["id"]))
+        form = ttk.Frame(fr)
+        form.pack(fill="x", pady=8)
+        ttk.Label(form, text="الكمية المرتجعة").pack(side="right", padx=4)
+        qty_e = ttk.Entry(form, width=10, justify="right")
+        qty_e.insert(0, "1")
+        qty_e.pack(side="right", padx=4)
+        ttk.Label(form, text="طريقة التسوية").pack(side="right", padx=4)
+        ref_cb = ttk.Combobox(form, values=["نقدي", "خصم من الدين"], state="readonly", width=16)
+        ref_cb.set("نقدي")
+        ref_cb.pack(side="right", padx=4)
+        ttk.Label(form, text="السبب").pack(side="right", padx=4)
+        reason_e = ttk.Entry(form, width=30, justify="right")
+        reason_e.pack(side="right", padx=4)
+
+        def submit():
+            sel = t.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد السطر المراد الإرجاع منه", parent=dlg)
+                return
+            try:
+                q = int(num(qty_e.get()))
+            except Exception:
+                q = 0
+            reason = reason_e.get().strip() or "إرجاع من العميل"
+            try:
+                with connect() as c:
+                    amount = apply_sale_return(c, int(sel[0]), q, ref_cb.get(), reason, self.user)
+            except Exception as e:
+                messagebox.showerror("خطأ", str(e), parent=dlg)
+                return
+            messagebox.showinfo("تم", f"سُجّل إرجاع {q} قطعة بمبلغ {sar(amount)} ({ref_cb.get()}).\nرجعت الكمية للمخزون وسُجّل الإرجاع باسمك.",
+                                parent=dlg)
+            dlg.destroy()
+            try:
+                parent.destroy()
+            except (AttributeError, tk.TclError):
+                pass
+            self.sales()
+
+        ttk.Button(dlg, text="✔ تسجيل الإرجاع", style="Success.TButton", command=submit).pack(pady=8, ipadx=24)
+        self.autosize(dlg, fr, 880)
+
+    def invoice_void_dialog(self, invoice_no, parent=None):
+        if not self.can("returns"):
+            return
+        reason = simpledialog.askstring("إلغاء الفاتورة", f"سبب إلغاء الفاتورة {invoice_no} (إجباري):", parent=parent or self)
+        if reason is None:
+            return
+        reason = reason.strip()
+        if not reason:
+            messagebox.showwarning("تنبيه", "لازم تكتب سبب الإلغاء — يُحفظ مع اسمك على الفاتورة وفي سجل التعديلات.",
+                                   parent=parent or self)
+            return
+        with connect() as c:
+            info = c.execute("""SELECT COUNT(*) n, COALESCE(SUM(price*qty),0) total, COALESCE(SUM(paid),0) paid
+                                FROM sales WHERE invoice=? AND COALESCE(voided,0)=0""", (invoice_no,)).fetchone()
+        if not info or not info["n"]:
+            messagebox.showwarning("تنبيه", "الفاتورة غير موجودة أو ملغاة مسبقًا", parent=parent or self)
+            return
+        if not messagebox.askyesno("تأكيد الإلغاء",
+                                   f"فاتورة {invoice_no}\nالإجمالي {sar(info['total'])} — المدفوع {sar(info['paid'])}\n\n"
+                                   "سيتم إرجاع البضاعة للمخزون، وتبقى الفاتورة محفوظة بعلامة (ملغاة) مع سببها واسمك.\n"
+                                   "أي مبلغ مدفوع يعتبر مرتجعًا نقديًا للعميل.\n\nمتابعة؟", parent=parent or self):
+            return
+        try:
+            with connect() as c:
+                n = void_invoice(c, invoice_no, reason, self.user)
+        except Exception as e:
+            messagebox.showerror("خطأ", str(e), parent=parent or self)
+            return
+        messagebox.showinfo("تم", f"أُلغيت الفاتورة وأُعيد {n} قطعة للمخزون.\nسُجّل الإلغاء باسمك في سجل التعديلات.",
+                            parent=parent or self)
+        try:
+            parent.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+        self.sales()
 
     # ---------------------------------------------------------- العملاء والديون
     def customers(self):
@@ -3441,11 +4043,16 @@ class App(tk.Tk):
             with connect() as c:
                 rows = c.execute("""
                     SELECT cu.id,cu.name,cu.phone,
-                    COUNT(DISTINCT s.invoice) invoices,
-                    COALESCE(SUM(s.price*s.qty),0) total,
-                    COALESCE(SUM(s.paid),0) paid,
+                    COUNT(DISTINCT CASE WHEN COALESCE(s.voided,0)=0 THEN s.invoice END) invoices,
+                    COALESCE(SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.price*s.qty END),0) total,
+                    COALESCE(SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.paid END),0) paid,
                     COALESCE((SELECT SUM(dp.amount) FROM debt_payments dp WHERE dp.customer_id=cu.id),0) later,
-                    COALESCE(SUM(s.price*s.qty),0)-COALESCE(SUM(s.paid),0)
+                    COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                              WHERE x.customer_id=cu.id AND COALESCE(x.voided,0)=0 AND sr.refund_type<>'نقدي'),0) debt_returns,
+                    COALESCE(SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.price*s.qty END),0)
+                    -COALESCE(SUM(CASE WHEN COALESCE(s.voided,0)=1 THEN 0 ELSE s.paid END),0)
+                    -COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                               WHERE x.customer_id=cu.id AND COALESCE(x.voided,0)=0 AND sr.refund_type<>'نقدي'),0)
                     -COALESCE((SELECT SUM(dp.amount) FROM debt_payments dp WHERE dp.customer_id=cu.id),0) remaining
                     FROM customers cu
                     LEFT JOIN sales s ON s.customer_id=cu.id
@@ -3465,8 +4072,12 @@ class App(tk.Tk):
             with connect() as c:
                 rows = c.execute("""
                     SELECT invoice,MIN(date) date,MAX(customer) customer,
-                    MAX(customer_phone) phone,SUM(price*qty) total,COALESCE(SUM(paid),0) paid
-                    FROM sales WHERE customer_id=? GROUP BY invoice ORDER BY MIN(id) DESC
+                    MAX(customer_phone) phone,
+                    SUM(price*qty)-COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                                             WHERE x.invoice=sales.invoice AND COALESCE(x.voided,0)=0),0) total,
+                    COALESCE(SUM(paid),0)-COALESCE((SELECT SUM(sr.amount) FROM sale_returns sr JOIN sales x ON x.id=sr.sale_id
+                                             WHERE x.invoice=sales.invoice AND COALESCE(x.voided,0)=0 AND sr.refund_type='نقدي'),0) paid
+                    FROM sales WHERE customer_id=? AND COALESCE(voided,0)=0 GROUP BY invoice ORDER BY MIN(id) DESC
                 """, (customer_id,)).fetchall()
             win = tk.Toplevel(self)
             win.title("فواتير العميل " + str(vals[1]))
@@ -3531,9 +4142,7 @@ class App(tk.Tk):
         if amount <= 0:
             raise ValueError("المبلغ يجب أن يكون أكبر من صفر")
         with connect() as c:
-            debt = c.execute("SELECT COALESCE(SUM(price*qty),0)-COALESCE(SUM(paid),0) FROM sales WHERE customer_id=?", (customer_id,)).fetchone()[0]
-            later = c.execute("SELECT COALESCE(SUM(amount),0) FROM debt_payments WHERE customer_id=?", (customer_id,)).fetchone()[0]
-            remaining = debt - later
+            remaining = total_customer_debt(c, customer_id)
             if amount > remaining + 0.001:
                 raise ValueError(f"المبلغ أكبر من المتبقي على العميل ({sar(max(0, remaining))})")
             c.execute("INSERT INTO debt_payments(customer_id,date,amount,notes,seller) VALUES(?,?,?,?,?)",
@@ -3564,6 +4173,11 @@ class App(tk.Tk):
         st_f = ttk.Combobox(frow, values=["الكل", "معلّقة (لم تُضف للمخزون)", "مستلمة"], state="readonly", width=24)
         st_f.set("الكل")
         st_f.pack(side="right", padx=4)
+        ttk.Label(frow, text="عرض فاتورة برقمها").pack(side="right", padx=4)
+        inv_f = ttk.Entry(frow, width=20, justify="right")
+        inv_f.pack(side="right", padx=4)
+        ttk.Button(frow, text="📄 اعرض أصناف الفاتورة", style="Accent.TButton",
+                   command=lambda: open_invoice(inv_f.get())).pack(side="left", padx=4)
 
         cols = ("id", "batch", "date", "item", "category", "supplier", "qty", "buy", "expense", "landed", "status")
         heads = {"id": "رقم", "batch": "رقم الفاتورة", "date": "التاريخ", "item": "الصنف", "category": "نوع القطعة", "supplier": "المورد", "qty": "الكمية", "buy": "سعر الوحدة", "expense": "المصاريف", "landed": "التكلفة النهائية", "status": "الحالة"}
@@ -3583,6 +4197,9 @@ class App(tk.Tk):
                 sql += " AND p.status='pending'"
             elif st_f.get() == "مستلمة":
                 sql += " AND COALESCE(p.status,'received')='received'"
+            if inv_f.get().strip():
+                sql += " AND p.batch=?"
+                params.append(inv_f.get().strip())
             sql += " ORDER BY (p.status='pending') DESC,p.id DESC LIMIT 500"
             with connect() as c:
                 rows = c.execute(sql, params).fetchall()
@@ -3634,6 +4251,76 @@ class App(tk.Tk):
             if messagebox.askyesno("طباعة الباركود", f"سيتم طباعة {total} ملصق (ملصق لكل قطعة) برمز المورد على الباركود. متابعة؟"):
                 self._print_labels(entries)
 
+        def open_invoice(batch=None):
+            """يعرض كل أصناف فاتورة الشراء برقمها مع الكميات والأسعار والإجمالي."""
+            batch = str(batch or "").strip()
+            if not batch:
+                sel = t.selection()
+                if not sel:
+                    messagebox.showwarning("تنبيه", "اكتب رقم الفاتورة أو حدد سطرًا من الجدول")
+                    return
+                batch = str(t.item(sel[0], "values")[1])
+            with connect() as c:
+                rows = c.execute("""SELECT p.*,i.item_no,i.part,i.car FROM purchases p
+                                    LEFT JOIN items i ON i.id=p.item_id WHERE p.batch=? ORDER BY p.supplier,p.id""",
+                                 (batch,)).fetchall()
+            if not rows:
+                messagebox.showwarning("تنبيه", f"لا توجد فاتورة شراء برقم: {batch}")
+                return
+            win = tk.Toplevel(self)
+            win.title("أصناف فاتورة الشراء " + batch)
+            win.configure(bg=BG)
+            win.geometry("1080x620")
+            body = ttk.Frame(win, padding=12)
+            body.pack(fill="both", expand=True)
+            bar = ttk.Frame(win, padding=8)
+            bar.pack(side="bottom", fill="x")
+            sups = sorted({r["supplier"] for r in rows if r["supplier"]})
+            ttk.Label(body, text=f"فاتورة الشراء رقم {batch}", style="Title.TLabel").pack(anchor="e")
+            ttk.Label(body, text=f"المورد: {' / '.join(sups) or '—'}    التاريخ: {str(rows[0]['date'])[:16]}",
+                      style="Sub.TLabel").pack(anchor="e")
+            vt = make_tree(body, ("item_no", "part", "car", "supplier", "qty", "buy", "expense", "landed", "total", "status"),
+                           {"item_no": "رقم الصنف", "part": "رقم القطعة", "car": "السيارة", "supplier": "المورد", "qty": "الكمية",
+                            "buy": "سعر الوحدة", "expense": "المصاريف", "landed": "التكلفة النهائية", "total": "إجمالي السطر", "status": "الحالة"},
+                           {"item_no": 105, "part": 115, "car": 140, "supplier": 120, "qty": 60, "buy": 90, "expense": 80, "landed": 110, "total": 100, "status": 160})
+            tot_qty = tot_val = 0.0
+            pending_ids = []
+            for r in rows:
+                q = max(int(num(r["qty"])), 1)
+                line_total = num(r["qty"]) * (num(r["buy"]) + num(r["expense"]) / q)
+                tot_qty += num(r["qty"])
+                tot_val += line_total
+                pending = (r["status"] or "received") == "pending"
+                if pending:
+                    pending_ids.append(r["id"])
+                add_row(vt, (r["item_no"] or "", r["part"] or "", r["car"] or "", r["supplier"], r["qty"],
+                             sar(r["buy"]), sar(r["expense"]), sar(r["landed"]), sar(line_total),
+                             "⏳ لم تُضف للمخزون" if pending else "✅ أُضيفت للمخزون"),
+                        iid=str(r["id"]), extra=("low",) if pending else ())
+            ttk.Label(body, text=f"عدد الأسطر: {len(rows)}   |   القطع: {int(tot_qty)}   |   إجمالي التكلفة: {sar(tot_val)}",
+                      font=(FONT, 11, "bold")).pack(anchor="e", pady=4)
+
+            def receive_inv():
+                if not pending_ids:
+                    messagebox.showinfo("تنبيه", "كل أسطر هذه الفاتورة مضافة للمخزون", parent=win)
+                    return
+                if not messagebox.askyesno("تأكيد", f"إضافة {len(pending_ids)} سطر من هذه الفاتورة للمخزون؟", parent=win):
+                    return
+                try:
+                    n_, ch_ = self._receive_purchases(pending_ids)
+                except Exception as e:
+                    messagebox.showerror("خطأ", str(e), parent=win)
+                    return
+                messagebox.showinfo("تم", f"تمت إضافة {n_} سطر للمخزون." +
+                                    ("\n\n" + "\n".join(ch_[:10]) if ch_ else ""), parent=win)
+                win.destroy()
+                load()
+
+            if pending_ids:
+                ttk.Button(bar, text="✔ إضافة أصناف الفاتورة للمخزون", style="Success.TButton",
+                           command=receive_inv).pack(side="right", padx=4)
+            ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+
         def delete_sel():
             ids = self._invoice_pending_ids(t.selection())
             if not ids:
@@ -3655,6 +4342,8 @@ class App(tk.Tk):
         ttk.Button(row, text="إضافة كل المعلّقة", command=lambda: receive(all_pending())).pack(side="right", padx=4)
         ttk.Button(row, text="🔍 سجل أسعار الصنف", command=lambda: self.price_history(None)).pack(side="right", padx=4)
         ttk.Button(row, text="حذف الفاتورة المعلّقة", style="Danger.TButton", command=delete_sel).pack(side="left", padx=4)
+        inv_f.bind("<Return>", lambda e: load())
+        t.bind("<Double-1>", lambda e: open_invoice())
         load()
 
     def _invoice_pending_ids(self, selected):
@@ -3705,6 +4394,11 @@ class App(tk.Tk):
                     WHERE id=?
                 """, (q1, round(nb, 4), round(ne, 4), p["supplier"], b1, p["item_id"]))
                 c.execute("UPDATE purchases SET status='received', received_at=? WHERE id=?", (now_str(), pid))
+                c.execute("UPDATE items SET updated_by=?,updated_at=? WHERE id=?", (self.user, now_str(), p["item_id"]))
+                record_supplier_cost(c, p["item_id"], p["supplier"], b1, e1)
+                log_stock(c, p["item_id"], q1, "مشتريات", p["batch"] or str(pid), self.user, p["supplier"] or "")
+                log_audit(c, self.user, "استلام مشتريات", "purchase", pid,
+                          f"{p['batch']} | {p['supplier']} | كمية {q1} | تكلفة {b1 + e1:.2f}")
                 n += 1
                 old_cost, new_cost = b0 + e0, nb + ne
                 if unknown:
@@ -4060,6 +4754,7 @@ class App(tk.Tk):
                 if c.execute("SELECT 1 FROM suppliers WHERE UPPER(code)=? AND id<>?", (code, sid)).fetchone():
                     raise ValueError("هذا الرمز مستخدم لمورد آخر")
                 c.execute("UPDATE suppliers SET phone=?,notes=?,code=? WHERE id=?", (d["phone"], d["notes"], code, sid))
+                log_audit(c, self.user, "تعديل مورد", "supplier", sid, f"{d['phone']} | {d['notes']} | رمز {code}")
 
         def edit():
             sel = t.selection()
@@ -4131,6 +4826,7 @@ class App(tk.Tk):
             raise ValueError("المبلغ يجب أن يكون أكبر من صفر")
         with connect() as c:
             c.execute("INSERT INTO expenses(date,category,amount,notes) VALUES(?,?,?,?)", (now_str(), d["category"], amount, d["notes"]))
+            log_audit(c, self.user, "تسجيل مصروف", "expense", "", f"{d['category']} | {amount:.2f} | {d['notes']}")
 
     # ------------------------------------------------------------ نموذج عام
     def form(self, title, fields, callback, on_done=None, height=None):
@@ -4469,6 +5165,135 @@ class App(tk.Tk):
         load3()
 
     # ---------------------------------------------------------- المستخدمون والصلاحيات
+    # ---------------------------------------------------------- سجل الحركة والتعديلات
+    def logs_page(self):
+        if not (self.role == "admin" or self.can("inv_edit")):
+            return
+        self.clear("logs")
+        self.page_title("سجل الحركة والتعديلات", "لماذا تغيّرت الكمية؟ من عدّل الصنف أو السعر؟ كل ذلك مسجّل هنا بالتاريخ والمستخدم")
+        nb = ttk.Notebook(self.body)
+        nb.pack(fill="both", expand=True, pady=6)
+
+        # ---------- حركة المخزون
+        stock_tab = ttk.Frame(nb, padding=10)
+        nb.add(stock_tab, text="📦 حركة المخزون")
+        frow = ttk.Frame(stock_tab)
+        frow.pack(fill="x", pady=4)
+        ttk.Label(frow, text="بحث (رقم الصنف / القطعة / المرجع)").pack(side="right", padx=4)
+        q = ttk.Entry(frow, width=24, justify="right")
+        q.pack(side="right", padx=4)
+        ttk.Label(frow, text="السبب").pack(side="right", padx=4)
+        with connect() as c:
+            reasons = ["الكل"] + [r[0] for r in c.execute("SELECT DISTINCT reason FROM stock_movements ORDER BY reason").fetchall() if r[0]]
+        rs = ttk.Combobox(frow, values=reasons, state="readonly", width=16)
+        rs.set("الكل")
+        rs.pack(side="right", padx=4)
+        ttk.Label(frow, text="من").pack(side="right", padx=4)
+        d1 = ttk.Entry(frow, width=11, justify="center")
+        d1.pack(side="right", padx=4)
+        ttk.Label(frow, text="إلى").pack(side="right", padx=4)
+        d2 = ttk.Entry(frow, width=11, justify="center")
+        d2.pack(side="right", padx=4)
+        st = make_tree(stock_tab, ("ts", "item", "delta", "qty_after", "reason", "reference", "user", "note"),
+                       {"ts": "التاريخ", "item": "الصنف", "delta": "التغيير", "qty_after": "الرصيد بعد", "reason": "السبب",
+                        "reference": "المرجع", "user": "بواسطة", "note": "ملاحظات"},
+                       {"ts": 145, "item": 250, "delta": 70, "qty_after": 80, "reason": 120, "reference": 150, "user": 110, "note": 220})
+
+        def load_stock(*_):
+            term = "%" + q.get().strip() + "%"
+            sql = """SELECT m.*,i.item_no,i.part FROM stock_movements m LEFT JOIN items i ON i.id=m.item_id
+                     WHERE (COALESCE(i.item_no,'') LIKE ? OR COALESCE(i.part,'') LIKE ? OR COALESCE(m.reference,'') LIKE ?)
+                     AND (?='الكل' OR m.reason=?)
+                     AND (?='' OR substr(m.ts,1,10)>=?) AND (?='' OR substr(m.ts,1,10)<=?)
+                     ORDER BY m.id DESC LIMIT 800"""
+            with connect() as c:
+                rows = c.execute(sql, (term, term, term, rs.get(), rs.get(),
+                                       d1.get().strip(), d1.get().strip(), d2.get().strip(), d2.get().strip())).fetchall()
+            clear_tree(st)
+            for r in rows:
+                delta = int(num(r["delta"]))
+                add_row(st, (r["ts"], f"{r['item_no'] or ''} | {r['part'] or ''}", f"{delta:+d}", r["qty_after"],
+                             r["reason"], r["reference"], r["username"], r["note"]),
+                        extra=("out",) if delta < 0 else ())
+
+        ttk.Button(frow, text="🔍 عرض", style="Accent.TButton", command=load_stock).pack(side="right", padx=4)
+        q.bind("<Return>", lambda e: load_stock())
+        rs.bind("<<ComboboxSelected>>", load_stock)
+        load_stock()
+
+        # ---------- سجل التعديلات
+        if self.role == "admin":
+            audit_tab = ttk.Frame(nb, padding=10)
+            nb.add(audit_tab, text="🗂 سجل التعديلات")
+            arow = ttk.Frame(audit_tab)
+            arow.pack(fill="x", pady=4)
+            ttk.Label(arow, text="بحث (المستخدم / الحدث / التفاصيل)").pack(side="right", padx=4)
+            aq = ttk.Entry(arow, width=30, justify="right")
+            aq.pack(side="right", padx=4)
+            ttk.Label(arow, text="نوع الحدث").pack(side="right", padx=4)
+            with connect() as c:
+                actions = ["الكل"] + [r[0] for r in c.execute("SELECT DISTINCT action FROM audit_log ORDER BY action").fetchall() if r[0]]
+            acb = ttk.Combobox(arow, values=actions, state="readonly", width=22)
+            acb.set("الكل")
+            acb.pack(side="right", padx=4)
+            at = make_tree(audit_tab, ("ts", "username", "action", "entity", "details"),
+                           {"ts": "التاريخ", "username": "المستخدم", "action": "الحدث", "entity": "على", "details": "التفاصيل"},
+                           {"ts": 150, "username": 110, "action": 160, "entity": 100, "details": 520})
+
+            def load_audit(*_):
+                term = "%" + aq.get().strip() + "%"
+                with connect() as c:
+                    rows = c.execute("""SELECT * FROM audit_log
+                                        WHERE (username LIKE ? OR action LIKE ? OR details LIKE ?)
+                                        AND (?='الكل' OR action=?)
+                                        ORDER BY id DESC LIMIT 800""",
+                                     (term, term, term, acb.get(), acb.get())).fetchall()
+                clear_tree(at)
+                for r in rows:
+                    add_row(at, (r["ts"], r["username"], r["action"], f"{r['entity']} {r['entity_id']}".strip(), r["details"]))
+
+            ttk.Button(arow, text="🔍 عرض", style="Accent.TButton", command=load_audit).pack(side="right", padx=4)
+            aq.bind("<Return>", lambda e: load_audit())
+            acb.bind("<<ComboboxSelected>>", load_audit)
+            load_audit()
+
+    def stock_log_window(self, item_id=None):
+        """سجل حركة صنف واحد: كل زيادة أو نقص وسببها ومن قام بها."""
+        if item_id is None:
+            self.logs_page()
+            return
+        with connect() as c:
+            it = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            rows = c.execute("SELECT * FROM stock_movements WHERE item_id=? ORDER BY id DESC LIMIT 400", (item_id,)).fetchall()
+            sup = supplier_costs_text(c, item_id)
+        if not it:
+            return
+        win = tk.Toplevel(self)
+        win.title("سجل حركة الصنف " + str(it["item_no"]))
+        win.configure(bg=BG)
+        win.geometry("1000x600")
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(side="bottom", fill="x")
+        ttk.Label(body, text=f"{it['item_no']} | {it['part']} — {it['car'] or ''}", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(body, text=f"المتوفر الآن: {it['qty']}   |   التكلفة: {sar(num(it['buy']) + num(it['expense']))}   |   "
+                             f"الموردون: {sup or '—'}   |   آخر تعديل: {it['updated_by'] or '—'} — {it['updated_at'] or '—'}",
+                  style="Sub.TLabel").pack(anchor="e")
+        t = make_tree(body, ("ts", "delta", "qty_after", "reason", "reference", "user", "note"),
+                      {"ts": "التاريخ", "delta": "التغيير", "qty_after": "الرصيد بعد", "reason": "السبب",
+                       "reference": "المرجع", "user": "بواسطة", "note": "ملاحظات"},
+                      {"ts": 150, "delta": 70, "qty_after": 80, "reason": 130, "reference": 170, "user": 110, "note": 260})
+        for r in rows:
+            delta = int(num(r["delta"]))
+            add_row(t, (r["ts"], f"{delta:+d}", r["qty_after"], r["reason"], r["reference"], r["username"], r["note"]),
+                    extra=("out",) if delta < 0 else ())
+        if not rows:
+            ttk.Label(body, text="لا توجد حركات مسجلة لهذا الصنف بعد. تُسجّل الحركة تلقائيًا مع البيع والشراء والإرجاع وأي تعديل يدوي.",
+                      style="Muted.TLabel").pack(anchor="e", pady=6)
+        ttk.Button(bar, text="📜 سجل كل الحركة", command=lambda: (win.destroy(), self.logs_page())).pack(side="right", padx=4)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+
     def users_page(self):
         if self.role != "admin":
             return
@@ -4514,6 +5339,7 @@ class App(tk.Tk):
                     messagebox.showwarning("تنبيه", "لازم يبقى مدير واحد على الأقل")
                     return
                 c.execute("DELETE FROM users WHERE username=?", (name,))
+                log_audit(c, self.user, "حذف مستخدم", "user", name, f"الدور: {r['role'] if r else ''}")
             load()
 
         ttk.Button(row, text="＋ إضافة مستخدم", style="Accent.TButton", command=lambda: self.user_dialog(None, on_done=load)).pack(side="right", padx=4)
@@ -4603,6 +5429,8 @@ class App(tk.Tk):
                             raise ValueError("اسم المستخدم موجود مسبقًا")
                         s, h = pw_hash(pw)
                         c.execute("INSERT INTO users(username,salt,hash,role,perms) VALUES(?,?,?,?,?)", (name, s, h, role, perms))
+                    log_audit(c, self.user, "تعديل مستخدم" if editing else "إضافة مستخدم", "user", name,
+                              f"الدور: {'مدير' if role == 'admin' else 'موظف'}" + (" | تغيير كلمة المرور" if pw else ""))
             except Exception as e:
                 messagebox.showerror("خطأ", str(e), parent=win)
                 return
@@ -5248,11 +6076,65 @@ class App(tk.Tk):
             c.execute("UPDATE suppliers SET phone=? WHERE name=?", (phone, rep_name))
         return phone
 
+    def supplier_compare_window(self, item_id, on_pick=None):
+        """مقارنة أسعار الموردين لصنف واحد داخل صفحة طلب الشراء: الأرخص، آخر سعر، ورمزه عند كل مورد."""
+        if not self.can("view_cost"):
+            return
+        with connect() as c:
+            it = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            rows = supplier_price_rows(c, item_id)
+        if not it:
+            return
+        win = tk.Toplevel(self)
+        win.title("مقارنة أسعار الموردين")
+        win.configure(bg=BG)
+        self.center(win, 1000, 520)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"مقارنة الموردين — {it['item_no']} | {it['part']}", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(body, text=f"{item_display_name(it)}    |    المتوفر: {it['qty']}    |    الأسعار من آخر فاتورة شراء مسجّلة لكل مورد",
+                  style="Sub.TLabel").pack(anchor="e")
+        t = make_tree(body, ("star", "supplier", "buy", "expense", "total", "last", "code", "phone"),
+                      {"star": "الأفضل", "supplier": "المورد", "buy": "سعر الشراء", "expense": "المصاريف للوحدة",
+                       "total": "التكلفة النهائية", "last": "آخر شراء", "code": "رمز الصنف عنده", "phone": "جواله"},
+                      {"star": 95, "supplier": 190, "buy": 100, "expense": 120, "total": 120, "last": 105, "code": 130, "phone": 120})
+        best = min([num(r["cost"]) + num(r["expense"]) for r in rows if (num(r["cost"]) + num(r["expense"])) > 0], default=None)
+        for i, r in enumerate(rows):
+            total = num(r["cost"]) + num(r["expense"])
+            cheapest = best is not None and abs(total - best) < 0.005
+            add_row(t, ("⭐ الأرخص" if cheapest else "", r["supplier"], sar(r["cost"]), sar(r["expense"]), sar(total),
+                        str(r["last_buy"] or r["updated_at"] or "")[:10], r["code"] or "", r["phone"] or ""),
+                    iid=str(i), extra=("best",) if cheapest else ())
+        if rows:
+            t.selection_set("0")
+        if not rows:
+            ttk.Label(body, text="لا توجد أسعار شراء مسجلة لهذا الصنف بعد. سجّل فاتورة شراء من كل مورد لتظهر المقارنة.",
+                      foreground=AMBER).pack(anchor="e", pady=10)
+
+        def pick():
+            sel = t.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد المورد أولًا", parent=win)
+                return
+            sup = rows[int(sel[0])]["supplier"]
+            win.destroy()
+            if on_pick:
+                on_pick(sup)
+
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill="x")
+        if on_pick and rows:
+            ttk.Button(bar, text="✔ استخدم هذا المورد في الطلب", style="Success.TButton", command=pick).pack(side="right", padx=4)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+        if on_pick and rows:
+            t.bind("<Double-1>", lambda e: pick())
+
     def po_page(self):
         if not self.can("po"):
             return
         self.clear("po")
         is_admin = self.role == "admin"
+        show_cost = self.can("view_cost")
         self.page_title("طلب شراء من المورد", "اختر المورد ← أضف الأصناف والكميات ← أصدر الطلب وأرسله واتساب")
         nb = ttk.Notebook(self.body)
         nb.pack(fill="both", expand=True)
@@ -5314,9 +6196,10 @@ class App(tk.Tk):
             ttk.Label(tab1, text="لا يوجد موردون مسجّلون. أضفهم من صفحة (الموردون) أولًا.", foreground=AMBER).pack(anchor="e")
 
         ttk.Label(tab1, text="أصناف المورد — انقر مرتين على الصنف لتحديد الكمية وإضافته للطلب", font=(FONT, 11, "bold")).pack(anchor="e")
-        av = make_tree(tab1, ("item_no", "name", "part", "code", "qty"),
-                       {"item_no": "رقم الصنف", "name": "اسم المنتج", "part": "رقم القطعة", "code": "رقم المنتج عند المورد", "qty": "المتوفر"},
-                       {"name": 300, "code": 180}, height=5)
+        av_cols = ("item_no", "name", "part", "code", "qty") + (("cost",) if show_cost else ())
+        av_heads = {"item_no": "رقم الصنف", "name": "اسم المنتج", "part": "رقم القطعة",
+                    "code": "رقم المنتج عند المورد", "qty": "المتوفر", "cost": "آخر تكلفة"}
+        av = make_tree(tab1, av_cols, av_heads, {"name": 280, "code": 165, "cost": 120}, height=5)
         av.configure(selectmode="extended")
         addrow = ttk.Frame(tab1)
         addrow.pack(fill="x", pady=4)
@@ -5326,18 +6209,28 @@ class App(tk.Tk):
         qty_e.pack(side="right", padx=4)
         ttk.Button(addrow, text="＋ إضافة المحدد للطلب", style="Accent.TButton", command=lambda: add_selected()).pack(side="right", padx=6)
         ttk.Button(addrow, text="＋ إضافة نواقص المورد", command=lambda: add_shortage()).pack(side="right", padx=6)
+        if show_cost:
+            ttk.Button(addrow, text="⚖ مقارنة الموردين والأسعار", style="Success.TButton",
+                       command=lambda: compare_selected()).pack(side="right", padx=6)
+        sel_info = tk.StringVar(value="")
+        if show_cost:
+            ttk.Label(tab1, textvariable=sel_info, style="Muted.TLabel", wraplength=1100, justify="right").pack(anchor="e", pady=2)
 
         ttk.Label(tab1, text="أصناف الطلب", font=(FONT, 11, "bold")).pack(anchor="e")
-        lt = make_tree(tab1, ("name", "code", "part", "qty"),
-                       {"name": "اسم المنتج", "code": "رقم المنتج عند المورد", "part": "رقم القطعة", "qty": "الكمية المطلوبة"},
-                       {"name": 300, "code": 180}, height=5)
+        lt_cols = ("name", "code", "part", "qty") + (("cost", "total") if show_cost else ())
+        lt_heads = {"name": "اسم المنتج", "code": "رقم المنتج عند المورد", "part": "رقم القطعة",
+                    "qty": "الكمية المطلوبة", "cost": "آخر تكلفة عند المورد", "total": "الإجمالي التقديري"}
+        lt = make_tree(tab1, lt_cols, lt_heads, {"name": 280, "code": 170, "cost": 120, "total": 120}, height=5)
         lrow = ttk.Frame(tab1)
         lrow.pack(fill="x")
         ttk.Button(lrow, text="حذف السطر المحدد", command=lambda: remove_line()).pack(side="right", padx=4)
+        if show_cost:
+            ttk.Button(lrow, text="⚖ مقارنة موردي السطر المحدد", command=lambda: compare_line()).pack(side="right", padx=4)
         ttk.Label(lrow, text="(انقر مرتين على سطر لتعديل كميته)", style="Muted.TLabel").pack(side="right", padx=6)
 
         lines = []
         state = {"rep": ""}
+        view_state = {"all": {}, "cheap": {}, "cost": {}}
 
         def refresh_dest():
             if is_admin:
@@ -5354,6 +6247,8 @@ class App(tk.Tk):
         def load_items(*_):
             clear_tree(av)
             rp = rep_cb.get()
+            if show_cost:
+                av.heading("cost", text=f"آخر تكلفة عند {rp}" if rp else "آخر تكلفة")
             if not all_var.get() and not rp:
                 return
             term = "%" + flt.get().strip() + "%"
@@ -5362,8 +6257,9 @@ class App(tk.Tk):
                      WHERE (COALESCE(i.part,'') LIKE ? OR COALESCE(i.car,'') LIKE ? OR COALESCE(i.rep_code,'') LIKE ? OR COALESCE(i.item_no,'') LIKE ? OR COALESCE(m.code,'') LIKE ?)"""
             params = [rp] + [term] * 5
             if not all_var.get():
-                sql += " AND (i.supplier=? OR m.id IS NOT NULL OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=i.id AND p.supplier=?))"
-                params.extend([rp, rp])
+                sql += (" AND (i.supplier=? OR m.id IS NOT NULL OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=i.id AND p.supplier=?)"
+                        " OR EXISTS(SELECT 1 FROM item_supplier_costs sc WHERE sc.item_id=i.id AND sc.supplier=?))")
+                params.extend([rp, rp, rp])
             if cat_f.get() != "الكل":
                 sql += " AND i.category=?"
                 params.append(cat_f.get())
@@ -5376,23 +6272,107 @@ class App(tk.Tk):
             sql += " ORDER BY i.item_no LIMIT 300"
             with connect() as c:
                 rows = c.execute(sql, params).fetchall()
+                ids = [r["id"] for r in rows]
+                all_sup = supplier_costs_map(c, ids)
+                cheap_map = cheapest_supplier_map(c, ids)
+                costmap = {}
+                if rp:
+                    for i in range(0, len(ids), 500):
+                        chunk = ids[i:i + 500]
+                        marks = ",".join("?" * len(chunk))
+                        for rr in c.execute(f"SELECT item_id,cost,expense FROM item_supplier_costs WHERE supplier=? AND item_id IN ({marks})",
+                                            [rp] + chunk).fetchall():
+                            costmap[rr["item_id"]] = num(rr["cost"]) + num(rr["expense"])
             for r in rows:
                 q_ = r["qty"] or 0
-                add_row(av, (r["item_no"], item_display_name(r), r["part"], r["sup_code"] or "", q_), iid=str(r["id"]),
+                own_cost = num(r["buy"]) + num(r["expense"])
+                if own_cost > 0 and r["id"] not in costmap and not rp:
+                    costmap[r["id"]] = own_cost
+                info = all_sup.get(r["id"], "")
+                if not info and clean_name(r["supplier"]) and own_cost > 0:
+                    info = f"{r['supplier']}: {sar(own_cost)}"
+                all_sup[r["id"]] = info
+                if r["id"] not in cheap_map and clean_name(r["supplier"]) and own_cost > 0:
+                    cheap_map[r["id"]] = f"{r['supplier']} ({sar(own_cost)})"
+                vals = [r["item_no"], item_display_name(r), r["part"], r["sup_code"] or "", q_]
+                if show_cost:
+                    vals.append(sar(costmap[r["id"]]) if costmap.get(r["id"]) else "—")
+                add_row(av, tuple(vals), iid=str(r["id"]),
                         extra=("out",) if q_ <= 0 else (("low",) if q_ <= 5 else ()))
+            view_state["all"], view_state["cheap"], view_state["cost"] = all_sup, cheap_map, costmap
 
         def redraw():
             clear_tree(lt)
+            if show_cost:
+                lt.heading("cost", text=f"آخر تكلفة عند {rep_cb.get()}" if rep_cb.get() else "آخر تكلفة")
             for i, ln in enumerate(lines):
-                add_row(lt, (ln["name"], ln["code"], ln["part"], ln["qty"]), iid=str(i))
-            total_var.set(f"عدد الأصناف: {len(lines)}   |   إجمالي الكمية: {sum(x['qty'] for x in lines)}")
+                vals = [ln["name"], ln["code"], ln["part"], ln["qty"]]
+                if show_cost:
+                    cst = ln.get("cost")
+                    vals += [sar(cst) if cst else "—", sar(cst * ln["qty"]) if cst else "—"]
+                add_row(lt, tuple(vals), iid=str(i))
+            total_txt = f"عدد الأصناف: {len(lines)}   |   إجمالي الكمية: {sum(x['qty'] for x in lines)}"
+            if show_cost:
+                est = sum((ln.get("cost") or 0) * ln["qty"] for ln in lines)
+                unknown = sum(1 for ln in lines if not ln.get("cost"))
+                total_txt += f"   |   التكلفة التقديرية: {sar(est)}" + (f"   ({unknown} صنف بدون سعر)" if unknown else "")
+            total_var.set(total_txt)
 
         def add_line(r, q):
             for ln in lines:
                 if ln["id"] == r["id"]:
                     ln["qty"] += q
                     return
-            lines.append({"id": r["id"], "name": item_display_name(r), "part": r["part"] or "", "code": self._supplier_code(r["id"], rep_cb.get()) or r["rep_code"] or "", "qty": q})
+            cost_ = None
+            if show_cost:
+                with connect() as c_:
+                    cost_ = supplier_unit_cost(c_, r["id"], rep_cb.get())
+            lines.append({"id": r["id"], "name": item_display_name(r), "part": r["part"] or "",
+                          "code": self._supplier_code(r["id"], rep_cb.get()) or r["rep_code"] or "", "qty": q, "cost": cost_})
+
+        def use_supplier(sup):
+            sup = (sup or "").strip()
+            if not sup:
+                return
+            if sup not in reps:
+                reps.append(sup)
+                rep_cb.configure(values=reps)
+            if rep_cb.get() != sup:
+                if lines and not messagebox.askyesno("تغيير المورد", "تغيير المورد سيفرغ أصناف الطلب الحالي. متابعة؟"):
+                    return
+                lines.clear()
+                redraw()
+            rep_cb.set(sup)
+            state["rep"] = sup
+            refresh_dest()
+            load_items()
+
+        def compare_selected():
+            sel = av.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد الصنف من قائمة أصناف المورد أولًا")
+                return
+            self.supplier_compare_window(int(sel[0]), on_pick=use_supplier)
+
+        def compare_line():
+            sel = lt.selection()
+            if not sel:
+                messagebox.showwarning("تنبيه", "حدد سطرًا من أصناف الطلب أولًا")
+                return
+            self.supplier_compare_window(lines[int(sel[0])]["id"], on_pick=use_supplier)
+
+        def show_sel_info(_e=None):
+            sel = av.selection()
+            if not sel:
+                sel_info.set("")
+                return
+            iid = int(sel[0])
+            info = view_state["all"].get(iid, "")
+            cheap = view_state["cheap"].get(iid)
+            if info:
+                sel_info.set("موردو الصنف وتكلفة كل مورد: " + info + (f"   |   ⭐ الأرخص: {cheap}" if cheap else ""))
+            else:
+                sel_info.set("لا توجد أسعار موردين مسجلة لهذا الصنف بعد — سجّل فاتورة شراء ليظهر فرق الأسعار.")
 
         def read_qty():
             q = int(num(qty_e.get()))
@@ -5482,7 +6462,14 @@ class App(tk.Tk):
                     return
                 status = "pending"
                 target = "جوال المدير"
-            if not messagebox.askyesno("تأكيد", f"سيتم إصدار طلب شراء ({len(lines)} صنف) وفتح واتساب لإرساله إلى {target}. متابعة؟"):
+            msg = f"سيتم إصدار طلب شراء ({len(lines)} صنف) وفتح واتساب لإرساله إلى {target}."
+            if show_cost:
+                est = sum((ln.get("cost") or 0) * ln["qty"] for ln in lines)
+                unknown = sum(1 for ln in lines if not ln.get("cost"))
+                msg += f"\n\nالتكلفة التقديرية (آخر سعر شراء لكل صنف): {sar(est)}"
+                if unknown:
+                    msg += f"\n({unknown} صنف بدون سعر شراء مسجّل — التكلفة غير مكتملة)"
+            if not messagebox.askyesno("تأكيد", msg + "\n\nمتابعة؟"):
                 return
             po_id, po_no = self._save_po(rp, lines, note.get().strip(), status)
             self._open_whatsapp(phone, self.po_message(po_id, to_manager=not is_admin))
@@ -5525,6 +6512,8 @@ class App(tk.Tk):
         make_f.bind("<<ComboboxSelected>>", on_make)
         model_f.bind("<<ComboboxSelected>>", load_items)
         av.bind("<Double-1>", add_prompt)
+        if show_cost:
+            av.bind("<<TreeviewSelect>>", show_sel_info)
         rep_cb.bind("<<ComboboxSelected>>", on_rep)
         flt.bind("<KeyRelease>", load_items)
         lt.bind("<Double-1>", edit_qty)
@@ -5932,12 +6921,15 @@ class App(tk.Tk):
         fr.pack(fill="both", expand=True)
         ttk.Label(fr, text="قد يكون هذا الصنف مكررًا", style="Title.TLabel").pack(anchor="e")
         ttk.Label(fr, text=subject, style="Sub.TLabel", wraplength=900, justify="right").pack(anchor="e", pady=(0, 6))
-        t = make_tree(fr, ("score", "item_no", "part", "rep", "name", "qty", "why"),
-                      {"score": "التشابه", "item_no": "رقم الصنف", "part": "رقم القطعة", "rep": "رمز المنتج عند المورد", "name": "الصنف", "qty": "المتوفر", "why": "السبب"},
-                      {"score": 70, "item_no": 100, "part": 120, "rep": 170, "name": 260, "qty": 70, "why": 260}, height=min(max(len(sims), 2), 6))
+        t = make_tree(fr, ("score", "item_no", "part", "rep", "sup", "name", "qty", "why"),
+                      {"score": "التشابه", "item_no": "رقم الصنف", "part": "رقم القطعة", "rep": "رمز المنتج عند المورد",
+                       "sup": "الموردون وتكلفة كل مورد", "name": "الصنف", "qty": "المتوفر", "why": "السبب"},
+                      {"score": 65, "item_no": 95, "part": 110, "rep": 140, "sup": 240, "name": 240, "qty": 65, "why": 230},
+                      height=min(max(len(sims), 2), 6))
         for i, s in enumerate(sims):
             rep_txt = " / ".join(x for x in (s["rep_code"], s["codes"]) if x)
-            add_row(t, (f"{s['score']}%", s["item_no"], s["part"] or "-", rep_txt or "-", s["name"] + (f" ({s['origin']})" if s["origin"] else ""), s["qty"], "، ".join(s["reasons"])),
+            add_row(t, (f"{s['score']}%", s["item_no"], s["part"] or "-", rep_txt or "-", s.get("supplier_info") or "-",
+                        s["name"] + (f" ({s['origin']})" if s["origin"] else ""), s["qty"], "، ".join(s["reasons"])),
                     iid=str(s["id"]), extra=("best",) if i == 0 else ())
         if sims:
             t.selection_set(str(sims[0]["id"]))
@@ -5969,7 +6961,10 @@ class App(tk.Tk):
             ttk.Button(btns, text="🔗 هو نفس الصنف — اربطه بالمحدد", style="Success.TButton", command=link).pack(side="right", padx=4)
             ttk.Button(btns, text="صنف مختلف — أنشئ صنفًا جديدًا", command=new).pack(side="right", padx=4)
         else:
-            ttk.Button(btns, text="صنف مختلف — احفظه كصنف جديد", style="Accent.TButton", command=new).pack(side="right", padx=4)
+            if mode == "add":
+                ttk.Button(btns, text="🔗 هو نفس الصنف — أضف الكمية للصنف الموجود", style="Success.TButton", command=link).pack(side="right", padx=4)
+            ttk.Button(btns, text=("صنف مختلف — احفظ التعديلات" if mode == "edit" else "صنف مختلف — احفظه كصنف جديد"),
+                       style="Accent.TButton", command=new).pack(side="right", padx=4)
         if left:
             ttk.Button(btns, text="⚖ مقارنة مع المحدد", style="Accent.TButton", command=compare).pack(side="right", padx=4)
             t.bind("<Double-1>", compare)
@@ -5997,7 +6992,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("🧬 فحص الأصناف المكررة")
         win.configure(bg=BG)
-        self.center(win, 1200, 680)
+        self.center(win, 1340, 680)
         bar = ttk.Frame(win, padding=10)
         bar.pack(side="bottom", fill="x")
         body = ttk.Frame(win, padding=14)
@@ -6007,9 +7002,10 @@ class App(tk.Tk):
                   style="Sub.TLabel", wraplength=1100, justify="right").pack(anchor="e")
         count_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=count_var, style="Muted.TLabel").pack(anchor="e")
-        t = make_tree(body, ("score", "a", "ac", "b", "bc", "why"),
-                      {"score": "التشابه", "a": "الصنف الأول", "ac": "أرقام الأول", "b": "الصنف الثاني", "bc": "أرقام الثاني", "why": "السبب"},
-                      {"score": 70, "a": 250, "ac": 190, "b": 250, "bc": 190, "why": 220})
+        t = make_tree(body, ("score", "a", "ac", "asup", "b", "bc", "bsup", "why"),
+                      {"score": "التشابه", "a": "الصنف الأول", "ac": "أرقام الأول", "asup": "موردوه وتكلفتهم",
+                       "b": "الصنف الثاني", "bc": "أرقام الثاني", "bsup": "موردوه وتكلفتهم", "why": "السبب"},
+                      {"score": 65, "a": 215, "ac": 160, "asup": 175, "b": 215, "bc": 160, "bsup": 175, "why": 190})
         pairs = []
 
         def label(r):
@@ -6030,8 +7026,9 @@ class App(tk.Tk):
                 self.config(cursor="")
             for i, p in enumerate(found):
                 pairs.append(p)
-                add_row(t, (f"{p['score']}%", label(p["a"]), codes_label(p["a"]) or "-", label(p["b"]), codes_label(p["b"]) or "-", "، ".join(p["reasons"])), iid=str(i),
-                        extra=("best",) if p["score"] >= 90 else ())
+                add_row(t, (f"{p['score']}%", label(p["a"]), codes_label(p["a"]) or "-", p["a"].get("supplier_info") or "-",
+                            label(p["b"]), codes_label(p["b"]) or "-", p["b"].get("supplier_info") or "-", "، ".join(p["reasons"])),
+                        iid=str(i), extra=("best",) if p["score"] >= 90 else ())
             count_var.set(f"عدد الأزواج المشتبه بها: {len(found)}" if found else "لم أجد أصنافًا مكررة ✔")
 
         def current():
@@ -6046,10 +7043,16 @@ class App(tk.Tk):
             if not p:
                 return
             keep, drop = (p["a"], p["b"]) if keep_first else (p["b"], p["a"])
+            with connect() as c:
+                sup_keep = supplier_costs_text(c, keep["id"]) or "—"
+                sup_drop = supplier_costs_text(c, drop["id"]) or "—"
             if not messagebox.askyesno("تأكيد الدمج",
                                        f"سيتم دمج:\n   {label_full(drop)}\nداخل:\n   {label_full(keep)}\n\n"
-                                       f"الكمية بعد الدمج: {keep['qty'] + drop['qty']}\n"
-                                       "كل مشتريات ومبيعات الصنف المحذوف تنتقل للصنف المُبقى، ورموزه وباركوده القديم تبقى تعمل.\n"
+                                       f"الكمية بعد الدمج: {keep['qty'] + drop['qty']}\n\n"
+                                       f"موردو الصنف المُبقى وتكلفتهم:\n   {sup_keep}\n"
+                                       f"موردو الصنف المحذوف وتكلفتهم:\n   {sup_drop}\n\n"
+                                       "بعد الدمج يبقى اسم كل مورد وتكلفته محفوظة عند الصنف، وتنتقل كل مشتريات ومبيعات\n"
+                                       "الصنف المحذوف للصنف المُبقى، ورموزه وباركوده القديم تبقى تعمل.\n"
                                        "لا يمكن التراجع (تُحفظ نسخة احتياطية تلقائيًا). متابعة؟", parent=win):
                 return
             try:
@@ -6057,7 +7060,7 @@ class App(tk.Tk):
                 os.makedirs(bdir, exist_ok=True)
                 shutil.copy2(DB, os.path.join(bdir, "قبل_الدمج_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".db"))
                 with connect() as c:
-                    res = merge_items(c, keep["id"], drop["id"])
+                    res = merge_items(c, keep["id"], drop["id"], self.user)
                 if res.get("delete_image"):
                     delete_image(res["delete_image"])
             except Exception as e:
@@ -6540,33 +7543,246 @@ class App(tk.Tk):
         if not self.can("reports"):
             return
         self.clear("reports")
-        self.page_title("التقارير", "ملخص المبيعات والمخزون والديون")
-        with connect() as c:
-            cards = [
-                ("عدد الأصناف", c.execute("SELECT COUNT(*) FROM items").fetchone()[0], ACCENT),
-                ("الكمية المتوفرة", c.execute("SELECT COALESCE(SUM(qty),0) FROM items").fetchone()[0], ACCENT),
-                ("إجمالي المبيعات", sar(c.execute("SELECT COALESCE(SUM(price*qty),0) FROM sales").fetchone()[0]), GREEN),
-                ("المبالغ المحصلة", sar(c.execute("SELECT COALESCE(SUM(paid),0) FROM sales").fetchone()[0]), GREEN),
-                ("ديون الفواتير قبل التحصيل اللاحق", sar(c.execute("SELECT COALESCE(SUM(price*qty-COALESCE(paid,0)),0) FROM sales").fetchone()[0]), AMBER),
-                ("تحصيلات الديون اللاحقة", sar(c.execute("SELECT COALESCE(SUM(amount),0) FROM debt_payments").fetchone()[0]), GREEN),
-                ("صافي ديون العملاء", sar(c.execute("SELECT COALESCE((SELECT SUM(price*qty-COALESCE(paid,0)) FROM sales),0)-COALESCE((SELECT SUM(amount) FROM debt_payments),0)").fetchone()[0]), RED),
-                ("إجمالي المصروفات", sar(c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses").fetchone()[0]), RED),
+        self.page_title("التقارير", "اختر الفترة لعرض المبيعات والمرتجعات والديون والمصروفات، مع تقرير إغلاق اليومية (Z)")
+        frow = ttk.Frame(self.body)
+        frow.pack(fill="x", pady=6)
+        ttk.Label(frow, text="الفترة").pack(side="right", padx=4)
+        preset = ttk.Combobox(frow, values=["اليوم", "أمس", "هذا الأسبوع", "هذا الشهر", "هذا العام", "الكل", "مخصص"],
+                              state="readonly", width=14)
+        preset.set("اليوم")
+        preset.pack(side="right", padx=4)
+        ttk.Label(frow, text="من").pack(side="right", padx=4)
+        d1_e = ttk.Entry(frow, width=12, justify="center")
+        d1_e.pack(side="right", padx=4)
+        ttk.Label(frow, text="إلى").pack(side="right", padx=4)
+        d2_e = ttk.Entry(frow, width=12, justify="center")
+        d2_e.pack(side="right", padx=4)
+        ttk.Button(frow, text="🔍 عرض", style="Accent.TButton", command=lambda: load()).pack(side="right", padx=4)
+        ttk.Button(frow, text="🧾 إغلاق اليومية (Z)", style="Success.TButton", command=self.z_report_window).pack(side="left", padx=4)
+        if self.role == "admin" or self.can("inv_edit"):
+            ttk.Button(frow, text="📜 سجل الحركة والتعديلات", command=self.logs_page).pack(side="left", padx=4)
+        range_lbl = ttk.Label(self.body, text="", style="Sub.TLabel")
+        range_lbl.pack(anchor="e")
+        cards_host = ttk.Frame(self.body)
+        cards_host.pack(fill="x", pady=6)
+        tables_host = ttk.Frame(self.body)
+        tables_host.pack(fill="both", expand=True)
+
+        def on_preset(_e=None):
+            today = datetime.now().date()
+            p = preset.get()
+            if p == "اليوم":
+                a = b = today.isoformat()
+            elif p == "أمس":
+                a = b = (today - timedelta(days=1)).isoformat()
+            elif p == "هذا الأسبوع":
+                a = (today - timedelta(days=(today.weekday() + 1) % 7)).isoformat()
+                b = today.isoformat()
+            elif p == "هذا الشهر":
+                a = today.replace(day=1).isoformat()
+                b = today.isoformat()
+            elif p == "هذا العام":
+                a = today.replace(month=1, day=1).isoformat()
+                b = today.isoformat()
+            elif p == "الكل":
+                a = b = ""
+            else:
+                return
+            d1_e.delete(0, "end")
+            d1_e.insert(0, a)
+            d2_e.delete(0, "end")
+            d2_e.insert(0, b)
+            load()
+
+        def load():
+            d1, d2 = d1_e.get().strip(), d2_e.get().strip()
+            for v in (d1, d2):
+                if v:
+                    try:
+                        datetime.strptime(v, "%Y-%m-%d")
+                    except ValueError:
+                        messagebox.showwarning("تنبيه", "التاريخ لازم يكون بالشكل 2026-10-26")
+                        return
+            if d1 and d2 and d1 > d2:
+                messagebox.showwarning("تنبيه", "تاريخ البداية بعد تاريخ النهاية")
+                return
+            for w in list(cards_host.winfo_children()) + list(tables_host.winfo_children()):
+                w.destroy()
+            with connect() as c:
+                tot = range_totals(c, d1, d2)
+                where, params = _range_where("s", d1, d2)
+                pays = c.execute(f"""SELECT COALESCE(NULLIF(s.payment_type,''),'كاش') ptype,
+                                     COUNT(DISTINCT s.invoice) n, COALESCE(SUM(s.price*s.qty),0) total,
+                                     COALESCE(SUM(s.paid),0) paid
+                                     FROM sales s WHERE {where} GROUP BY ptype ORDER BY total DESC""", params).fetchall()
+                sellers = c.execute(f"""SELECT COALESCE(NULLIF(s.seller,''),'غير مسجل') seller,
+                                     COUNT(DISTINCT s.invoice) invoices, COALESCE(SUM(s.qty),0) pieces,
+                                     COALESCE(SUM(s.price*s.qty),0) total, COALESCE(SUM(s.paid),0) paid
+                                     FROM sales s WHERE {where} GROUP BY COALESCE(NULLIF(s.seller,''),'غير مسجل')
+                                     ORDER BY total DESC""", params).fetchall()
+                returns = c.execute("""SELECT sr.*,i.item_no,i.part FROM sale_returns sr
+                                       JOIN sales x ON x.id=sr.sale_id LEFT JOIN items i ON i.id=x.item_id
+                                       WHERE (?='' OR substr(sr.ts,1,10)>=?) AND (?='' OR substr(sr.ts,1,10)<=?)
+                                       ORDER BY sr.id DESC LIMIT 100""", (d1, d1, d2, d2)).fetchall()
+                voids = c.execute("""SELECT invoice, MAX(customer) customer, MAX(void_by) by_, MAX(void_at) at_,
+                                     MAX(void_reason) reason, COALESCE(SUM(paid),0) paid, COALESCE(SUM(price*qty),0) total
+                                     FROM sales WHERE COALESCE(voided,0)=1
+                                     AND (?='' OR substr(void_at,1,10)>=?) AND (?='' OR substr(void_at,1,10)<=?)
+                                     GROUP BY invoice ORDER BY MAX(id) DESC LIMIT 100""", (d1, d1, d2, d2)).fetchall()
+                debts_now = total_customer_debt(c)
+            label = "كل الفترات" if not (d1 or d2) else f"من {d1 or 'البداية'} إلى {d2 or 'اليوم'}"
+            range_lbl.configure(text=f"الفترة: {label}")
+            cash_net = tot["net_collected"] + tot["debt_collected"] - tot["expenses"]
+            self.card_grid([
+                ("صافي المبيعات", sar(tot["net_sales"]), GREEN),
+                ("إجمالي المبيعات قبل المرتجع", sar(tot["gross"]), ACCENT),
+                ("المرتجعات", sar(tot["returns"]), RED),
+                ("المحصل من الفواتير", sar(tot["net_collected"]), GREEN),
+                ("تحصيل ديون لاحق", sar(tot["debt_collected"]), GREEN),
+                ("المصروفات", sar(tot["expenses"]), RED),
+                ("صافي الحركة النقدية", sar(cash_net), GREEN if cash_net >= 0 else RED),
+                ("عدد الفواتير / القطع", f"{tot['invoices']} / {int(tot['pieces'])}", ACCENT),
+                ("صافي ديون العملاء (كل الفترات)", sar(debts_now), RED),
+            ], 4, cards_host)
+
+            ttk.Label(tables_host, text="طرق الدفع", font=(FONT, 13, "bold")).pack(anchor="e", pady=(10, 0))
+            self.table(("ptype", "n", "total", "paid", "remaining"),
+                       {"ptype": "طريقة الدفع", "n": "عدد الفواتير", "total": "قيمة المبيعات", "paid": "المدفوع", "remaining": "المتبقي"},
+                       [(r["ptype"], r["n"], sar(r["total"]), sar(r["paid"]), sar(num(r["total"]) - num(r["paid"]))) for r in pays],
+                       parent=tables_host)
+            ttk.Label(tables_host, text="مبيعات كل بائع", font=(FONT, 13, "bold")).pack(anchor="e", pady=(10, 0))
+            self.table(("seller", "invoices", "pieces", "total", "paid", "remaining"),
+                       {"seller": "البائع", "invoices": "عدد الفواتير", "pieces": "عدد القطع", "total": "إجمالي المبيعات",
+                        "paid": "المحصل", "remaining": "المتبقي"},
+                       [(r["seller"], r["invoices"], r["pieces"], sar(r["total"]), sar(r["paid"]), sar(num(r["total"]) - num(r["paid"]))) for r in sellers],
+                       parent=tables_host)
+            if returns:
+                ttk.Label(tables_host, text="المرتجعات في الفترة", font=(FONT, 13, "bold")).pack(anchor="e", pady=(10, 0))
+                self.table(("ts", "invoice", "item", "qty", "amount", "type", "reason", "user"),
+                           {"ts": "التاريخ", "invoice": "الفاتورة", "item": "الصنف", "qty": "الكمية", "amount": "المبلغ",
+                            "type": "التسوية", "reason": "السبب", "user": "بواسطة"},
+                           [(r["ts"], r["invoice"], f"{r['item_no'] or ''} | {r['part'] or ''}", r["qty"], sar(r["amount"]),
+                             r["refund_type"], r["reason"], r["username"]) for r in returns],
+                           parent=tables_host)
+            if voids:
+                ttk.Label(tables_host, text="الفواتير الملغاة في الفترة", font=(FONT, 13, "bold")).pack(anchor="e", pady=(10, 0))
+                self.table(("invoice", "customer", "total", "paid", "at_", "by_", "reason"),
+                           {"invoice": "الفاتورة", "customer": "العميل", "total": "الإجمالي", "paid": "المدفوع",
+                            "at_": "وقت الإلغاء", "by_": "ألغاها", "reason": "السبب"},
+                           [(r["invoice"], r["customer"], sar(r["total"]), sar(r["paid"]), r["at_"], r["by_"], r["reason"]) for r in voids],
+                           parent=tables_host)
+
+        preset.bind("<<ComboboxSelected>>", on_preset)
+        for e_ in (d1_e, d2_e):
+            e_.bind("<Return>", lambda e: load())
+        on_preset()
+
+    def z_report_window(self):
+        """تقرير إغلاق اليومية: مبيعات كل طريقة دفع، الديون المحصلة، المصروفات، والنقد المتوقع في الصندوق."""
+        win = tk.Toplevel(self)
+        win.title("تقرير إغلاق اليومية (Z)")
+        win.configure(bg=BG)
+        win.geometry("780x680")
+        top = ttk.Frame(win, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="تاريخ اليومية").pack(side="right", padx=4)
+        d_e = ttk.Entry(top, width=14, justify="center")
+        d_e.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        d_e.pack(side="right", padx=4)
+        ttk.Button(top, text="🔄 عرض", style="Accent.TButton", command=lambda: build()).pack(side="right", padx=4)
+        box = tk.Text(win, wrap="word", font=("Consolas", 11), bg="white", relief="flat", padx=14, pady=12)
+        box.pack(fill="both", expand=True, padx=10, pady=6)
+        state = {"text": ""}
+
+        def build():
+            day = d_e.get().strip()
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showwarning("تنبيه", "التاريخ لازم يكون بالشكل 2026-10-26", parent=win)
+                return
+            with connect() as c:
+                tot = range_totals(c, day, day)
+                where, params = _range_where("s", day, day)
+                pays = c.execute(f"""SELECT COALESCE(NULLIF(s.payment_type,''),'كاش') ptype,
+                                     COUNT(DISTINCT s.invoice) n, COALESCE(SUM(s.price*s.qty),0) total,
+                                     COALESCE(SUM(s.paid),0) paid
+                                     FROM sales s WHERE {where} GROUP BY ptype ORDER BY total DESC""", params).fetchall()
+                cash_returns = num(c.execute("""SELECT COALESCE(SUM(amount),0) FROM sale_returns
+                                                WHERE substr(ts,1,10)=? AND refund_type='نقدي'""", (day,)).fetchone()[0])
+                late_void = num(c.execute("""SELECT COALESCE(SUM(paid),0) FROM sales
+                                             WHERE COALESCE(voided,0)=1 AND substr(void_at,1,10)=?
+                                             AND substr(date,1,10)<? """, (day, day)).fetchone()[0])
+                voids_today = c.execute("""SELECT COUNT(DISTINCT invoice) FROM sales
+                                           WHERE COALESCE(voided,0)=1 AND substr(void_at,1,10)=?""", (day,)).fetchone()[0]
+                open_debts = num(c.execute("""SELECT COALESCE(SUM(price*qty-paid),0) FROM sales
+                                              WHERE COALESCE(voided,0)=0 AND substr(date,1,10)=? AND price*qty>paid""",
+                                           (day,)).fetchone()[0])
+            expected = tot["paid"] + tot["debt_collected"] - cash_returns - late_void - tot["expenses"]
+            lines = [
+                "تقرير إغلاق اليومية (Z)",
+                "التاريخ: " + day,
+                "=" * 46,
+                "المبيعات",
+                f"  عدد الفواتير: {tot['invoices']}",
+                f"  القطع المباعة: {int(tot['pieces'])}",
+                f"  إجمالي المبيعات: {sar(tot['gross'])}",
+                f"  المرتجعات: {sar(tot['returns'])}",
+                f"  صافي المبيعات: {sar(tot['net_sales'])}",
+                "",
+                "التحصيل والصندوق",
+                f"  المدفوع عند البيع: {sar(tot['paid'])}",
+                f"  تحصيل ديون لاحقة: {sar(tot['debt_collected'])}",
+                f"  مرتجع نقدي للعملاء: {sar(cash_returns)}",
+                f"  مدفوع فواتير ملغاة سابقة: {sar(late_void)}",
+                f"  المصروفات: {sar(tot['expenses'])}",
+                f"  النقد المتوقع في الصندوق: {sar(expected)}",
+                "",
+                "طرق الدفع",
             ]
-            if self.can("view_cost"):
-                cards.append(("قيمة المخزون بالتكلفة", sar(c.execute("SELECT COALESCE(SUM(qty*(COALESCE(buy,0)+COALESCE(expense,0))),0) FROM items").fetchone()[0]), ACCENT))
-        self.card_grid(cards)
-        ttk.Label(self.body, text="مبيعات كل بائع", font=(FONT, 14, "bold")).pack(anchor="e", pady=(12, 0))
-        with connect() as c:
-            sellers = c.execute("""
-                SELECT COALESCE(NULLIF(seller,''),'غير مسجل') seller,
-                COUNT(*) operations, COALESCE(SUM(qty),0) pieces,
-                COALESCE(SUM(price*qty),0) total, COALESCE(SUM(paid),0) paid
-                FROM sales GROUP BY COALESCE(NULLIF(seller,''),'غير مسجل')
-                ORDER BY total DESC
-            """).fetchall()
-        self.table(("seller", "operations", "pieces", "total", "paid", "remaining"),
-                   {"seller": "البائع", "operations": "عدد عمليات البيع", "pieces": "عدد القطع المباعة", "total": "إجمالي قيمة المبيعات", "paid": "المبلغ المحصل", "remaining": "المتبقي"},
-                   [(r["seller"], r["operations"], r["pieces"], sar(r["total"]), sar(r["paid"]), sar(r["total"] - r["paid"])) for r in sellers])
+            for r in pays:
+                lines.append(f"  {r['ptype']}: مبيعات {sar(r['total'])} — مدفوع {sar(r['paid'])} — عدد {r['n']}")
+            if not pays:
+                lines.append("  لا مبيعات في هذا اليوم")
+            lines += [
+                "",
+                f"فواتير ملغاة اليوم: {voids_today}",
+                f"ديون جديدة غير محصلة اليوم: {sar(open_debts)}",
+                "=" * 46,
+                f"أُنشئ: {now_str()} — بواسطة: {self.user}",
+            ]
+            state["text"] = "\n".join(lines)
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", state["text"])
+            box.configure(state="disabled")
+
+        def copy_text():
+            self.clipboard_clear()
+            self.clipboard_append(state["text"] or box.get("1.0", "end").strip())
+            messagebox.showinfo("نسخ", "تم نسخ التقرير.", parent=win)
+
+        def print_text():
+            self.print_text_report("إغلاق يومية " + d_e.get().strip(), state["text"])
+
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="📋 نسخ التقرير", command=copy_text).pack(side="right", padx=4)
+        ttk.Button(bar, text="🖨 طباعة", style="Success.TButton", command=print_text).pack(side="right", padx=4)
+        ttk.Button(bar, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+        build()
+
+    def print_text_report(self, title, text):
+        if not text:
+            return
+        tmp = os.path.join(tempfile.gettempdir(), "report_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".html")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write('<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">'
+                    f'<title>{html.escape(title)}</title><style>body{{font-family:Arial;padding:18px}}'
+                    'pre{font-size:13px;line-height:1.8;white-space:pre-wrap}</style>'
+                    f'<h2>{html.escape(title)}</h2><pre>{html.escape(text)}</pre>'
+                    '<script>window.onload=()=>setTimeout(()=>window.print(),400)</script></html>')
+        webbrowser.open(Path(tmp).as_uri())
 
 
 if __name__ == "__main__":
