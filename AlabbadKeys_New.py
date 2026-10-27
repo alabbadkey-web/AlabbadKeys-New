@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.0"
+APP_VERSION = "16.7.1"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -706,6 +706,10 @@ def init():
         if "rep_code" not in item_cols:
             c.execute("ALTER TABLE items ADD COLUMN rep_code TEXT DEFAULT ''")
 
+        # رقم الريموت (للريموتات فقط) — يُلتقط من بادئة رقم القطعة ويُستخدم كرقم القطعة
+        if "remote_no" not in item_cols:
+            c.execute("ALTER TABLE items ADD COLUMN remote_no TEXT DEFAULT ''")
+
         # من أضاف الصنف ومن عدّله آخر مرة
         for col_name in ("created_by", "created_at", "updated_by", "updated_at"):
             if col_name not in item_cols:
@@ -1064,6 +1068,53 @@ def item_display_name(r):
 
 
 # ------------------------------------------------------------------ تنبيهات النواقص
+def remote_prefixes(c, make="", model=""):
+    """بادئات أرقام الريموت: ما يحدده المدير في الإعدادات + بداية أرقام ريموتات نفس السيارة المسجلة."""
+    out = []
+    for p in re.split(r"[,،;\n]+", setting("remote_prefixes") or ""):
+        p = p.strip()
+        if p and p not in out:
+            out.append(p)
+    rows = []
+    make, model = clean_name(make), clean_name(model)
+    if make:
+        if model:
+            rows = c.execute("""SELECT COALESCE(NULLIF(remote_no,''), part) v FROM items
+                                WHERE category LIKE '%ريموت%' AND make=? AND model=? AND COALESCE(part,'')<>''""",
+                             (make, model)).fetchall()
+        if len(rows) < 2:
+            rows = c.execute("""SELECT COALESCE(NULLIF(remote_no,''), part) v FROM items
+                                WHERE category LIKE '%ريموت%' AND make=? AND COALESCE(part,'')<>''""",
+                             (make,)).fetchall()
+    # البداية المشتركة بين ريموتين على الأقل (تتجاهل الأرقام الشاذة)
+    vals = sorted({clean_name(r["v"]).upper() for r in rows if r["v"]})
+    best, best_n = "", 0
+    for i in range(len(vals)):
+        for j in range(i + 1, len(vals)):
+            pfx = os.path.commonprefix([vals[i], vals[j]]).rstrip(" -_/")
+            if len(pfx) < 2:
+                continue
+            n = sum(1 for v in vals if v.startswith(pfx))
+            if n >= 2 and (n, len(pfx)) > (best_n, len(best)):
+                best, best_n = pfx, n
+    if best and best not in out:
+        out.append(best)
+    return out
+
+
+def get_remote_prefixes(make="", model=""):
+    with connect() as c:
+        return remote_prefixes(c, make, model)
+
+
+def is_remote_number(value, make="", model=""):
+    """هل يبدأ هذا الرقم ببادئة أرقام ريموتات نفس السيارة؟"""
+    v = str(value or "").strip().upper()
+    if not v:
+        return False
+    return any(v.startswith(p.upper()) for p in get_remote_prefixes(make, model))
+
+
 def low_stock_rows(c):
     """الأصناف التي وصلت كميتها إلى حد التنبيه المحدد لها أو أقل (أو نفدت)."""
     return c.execute("""
@@ -2875,6 +2926,54 @@ class App(tk.Tk):
         elif "ريموت" in cat_list:
             cat_cb.set("ريموت")
 
+        # ---- رقم الريموت (يظهر فقط عندما يكون نوع القطعة ريموت)
+        remote_no = entry(val("remote_no"))
+        remote_lbl = ttk.Label(frame, text="رقم الريموت")
+        remote_hint = ttk.Label(frame, text="", style="Muted.TLabel", wraplength=520, justify="right")
+        remote_btn = ttk.Button(frame, text="↧ من رقم القطعة")
+
+        def is_remote(cat=None):
+            return "ريموت" in str(cat if cat is not None else cat_cb.get())
+
+        def detect_remote(force=False):
+            if not is_remote():
+                return
+            raw = part.get().strip()
+            pfx = get_remote_prefixes(make_cb.get().strip(), model_cb.get().strip())
+            hint = ("بادئة أرقام ريموت هذه السيارة: " + " / ".join(pfx)) if pfx else \
+                   "لا توجد بادئة معروفة بعد — اكتبها من (الإعدادات ← بادئات أرقام الريموت) أو أضف ريموتين لنفس السيارة."
+            remote_hint.configure(text=hint)
+            if not raw:
+                return
+            if force or any(raw.upper().startswith(p.upper()) for p in pfx):
+                remote_no.delete(0, "end")
+                remote_no.insert(0, raw)
+
+        remote_btn.configure(command=lambda: detect_remote(force=True))
+        remote_row = counter[0]
+        remote_lbl.grid(row=remote_row, column=2, sticky="e", padx=5, pady=3)
+        remote_no.grid(row=remote_row, column=1, sticky="ew", padx=5, pady=3)
+        remote_btn.grid(row=remote_row, column=0, padx=2)
+        remote_hint.grid(row=remote_row + 1, column=0, columnspan=3, sticky="e", padx=5)
+        counter[0] += 2
+        remote_widgets = (remote_lbl, remote_no, remote_btn, remote_hint)
+
+        def sync_remote_row(*_):
+            if is_remote():
+                remote_lbl.grid()
+                remote_no.grid()
+                remote_btn.grid()
+                remote_hint.grid()
+                detect_remote()
+            else:
+                for w in remote_widgets:
+                    w.grid_remove()
+
+        cat_cb.bind("<<ComboboxSelected>>", lambda e: sync_remote_row())
+        part.bind("<Return>", lambda e: detect_remote())
+        part.bind("<FocusOut>", lambda e: detect_remote())
+        sync_remote_row()
+
         kind = entry(val("kind"))
         line("نوع المفتاح", kind)
 
@@ -2981,6 +3080,14 @@ class App(tk.Tk):
                               foreground=MUTED).pack(anchor="e")
 
         def save():
+            remote_val = ""
+            if is_remote():
+                remote_val = remote_no.get().strip()
+                raw_part = part.get().strip()
+                if not remote_val and raw_part:
+                    pfx = get_remote_prefixes(make_cb.get().strip(), model_cb.get().strip())
+                    if any(raw_part.upper().startswith(p.upper()) for p in pfx):
+                        remote_val = raw_part
             d = {
                 "item_no": item_no.get().strip(), "part": part.get().strip(),
                 "make": make_cb.get().strip(), "model": model_cb.get().strip(),
@@ -2988,6 +3095,7 @@ class App(tk.Tk):
                 "y1": y1.get().strip(), "y2": y2.get().strip(),
                 "category": cat_cb.get().strip(), "kind": kind.get().strip(),
                 "rep_code": rep_code.get().strip(),
+                "remote_no": remote_val,
                 "origin": origin_cb.get().strip(),
                 "min_qty": (min_qty_e.get().strip() if min_qty_e is not None else None),
                 "image_src": img["src"], "image_remove": img["remove"],
@@ -3000,6 +3108,8 @@ class App(tk.Tk):
                 "condition": "USED" if cond.get() == "مستعمل" else "NEW",
                 "notes": notes.get().strip(),
             }
+            if remote_val:
+                d["part"] = remote_val  # رقم القطعة يصبح رقم الريموت
             if not editing and not d["origin"]:
                 messagebox.showerror("خطأ", "اختر الأصل: أصلي أو صيني", parent=win)
                 return
@@ -3117,11 +3227,12 @@ class App(tk.Tk):
                 raise ValueError(f"رقم القطعة موجود مسبقًا بنفس الحالة. رقم الصنف: {duplicate['item_no']}")
             image_name = store_image(d.get("image_src"))
             cur = c.execute("""
-                INSERT INTO items(item_no,part,car,make,model,y1,y2,category,kind,supplier,rep_name,rep_code,qty,buy,expense,profit,retail,location,condition,notes,incomplete,image)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO items(item_no,part,car,make,model,y1,y2,category,kind,supplier,rep_name,rep_code,remote_no,qty,buy,expense,profit,retail,location,condition,notes,incomplete,image)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 item_no, d["part"].strip(), car, d["make"], d["model"], d["y1"], d["y2"],
-                d["category"], d["kind"], d.get("supplier", ""), d.get("rep_name", ""), d.get("rep_code", ""), qty, buy, expense,
+                d["category"], d["kind"], d.get("supplier", ""), d.get("rep_name", ""), d.get("rep_code", ""),
+                d.get("remote_no", ""), qty, buy, expense,
                 profit, num(d["retail"]), d["location"], state, d["notes"], incomplete, image_name
             ))
             c.execute("UPDATE items SET origin=? WHERE id=?", (d.get("origin", ""), cur.lastrowid))
@@ -3176,18 +3287,18 @@ class App(tk.Tk):
             if c.execute("SELECT 1 FROM items WHERE part=? AND UPPER(COALESCE(condition,'NEW'))=? AND id<>?", (d["part"].strip(), state, item_id)).fetchone():
                 raise ValueError("رقم القطعة موجود مسبقًا لصنف بنفس الحالة")
             base = (item_no, d["part"].strip(), car, make, model, d["y1"], d["y2"], d["category"], d["kind"],
-                    d.get("rep_name", ""), d.get("rep_code", ""),
+                    d.get("rep_name", ""), d.get("rep_code", ""), d.get("remote_no", ""),
                     qty, num(d["retail"]), d["location"], state, d["notes"])
             if self.can("view_cost"):
                 buy = num(d["buy"])
                 c.execute("""
-                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,notes=?,
+                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,remote_no=?,qty=?,retail=?,location=?,condition=?,notes=?,
                     buy=?,expense=?,profit=?,incomplete=?
                     WHERE id=?
                 """, base + (buy, round(buy * num(d["expense"]) / 100.0, 4), num(d["profit"]), 0 if buy > 0 else 1, item_id))
             else:
                 c.execute("""
-                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,qty=?,retail=?,location=?,condition=?,notes=?
+                    UPDATE items SET item_no=?,part=?,car=?,make=?,model=?,y1=?,y2=?,category=?,kind=?,rep_name=?,rep_code=?,remote_no=?,qty=?,retail=?,location=?,condition=?,notes=?
                     WHERE id=?
                 """, base + (item_id,))
             c.execute("UPDATE items SET origin=? WHERE id=?", (d.get("origin", ""), item_id))
@@ -3214,6 +3325,7 @@ class App(tk.Tk):
 
             if old:
                 changed("رقم القطعة", old["part"], d["part"].strip())
+                changed("رقم الريموت", old["remote_no"], d.get("remote_no", ""))
                 changed("السيارة", old["car"], car)
                 changed("نوع القطعة", old["category"], d["category"])
                 changed("نوع المفتاح", old["kind"], d["kind"])
@@ -5642,6 +5754,7 @@ class App(tk.Tk):
         ttk.Button(box, text="📄  إعداد Google Sheets", command=self.sync_from_settings).pack(fill="x", pady=5)
         ttk.Button(box, text="🔄  التحقق من وجود تحديث", style="Accent.TButton", command=self.check_for_updates).pack(fill="x", pady=5)
         ttk.Button(box, text="📞  مسؤول المشتريات (واتساب النواقص)", command=self.purchasing_dialog).pack(fill="x", pady=5)
+        ttk.Button(box, text="🔢  بادئات أرقام الريموت", command=self.remote_prefixes_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="👤  جوال المدير لاستلام طلبات الموظفين", command=self.manager_phone_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="🗂  نسخة كاملة (قاعدة البيانات + الصور)", command=self.backup_full).pack(fill="x", pady=5)
         ttk.Label(self.body, text="رابط Google Apps Script ورمز المزامنة يُحفظان محليًا", style="Muted.TLabel").pack(anchor="e", pady=4)
@@ -6185,6 +6298,14 @@ class App(tk.Tk):
             ("phone", "رقم واتساب (مثال 0501234567)", setting("purchasing_phone")),
         ], save, on_done=on_done)
 
+    def remote_prefixes_dialog(self, on_done=None):
+        def save(d):
+            setsetting("remote_prefixes", d["prefixes"].strip())
+
+        self.form("بادئات أرقام الريموت", [
+            ("prefixes", "البادئات مفصولة بفاصلة — مثال: 89070, RM-, KEY", setting("remote_prefixes")),
+        ], save, on_done=on_done)
+
     def backup_full(self):
         dest = filedialog.asksaveasfilename(defaultextension=".zip", initialfile="نسخة_كاملة_العباد.zip", filetypes=[("Zip", "*.zip")])
         if not dest:
@@ -6392,10 +6513,16 @@ class App(tk.Tk):
         model_f = ttk.Combobox(top2, values=["الكل"], state="readonly", width=16)
         model_f.set("الكل")
         model_f.pack(side="right", padx=4)
-        ttk.Label(top2, text="الكمية المتوفرة").pack(side="right", padx=4)
-        stock_f = ttk.Combobox(top2, values=STOCK_FILTERS, state="readonly", width=11)
+        top3 = ttk.Frame(tab1)
+        top3.pack(fill="x", pady=(0, 4))
+        ttk.Label(top3, text="الكمية المتوفرة").pack(side="right", padx=4)
+        stock_f = ttk.Combobox(top3, values=STOCK_FILTERS, state="readonly", width=13)
         stock_f.set("الكل")
         stock_f.pack(side="right", padx=4)
+        ttk.Label(top3, text="الحالة (جديد / مستعمل)").pack(side="right", padx=4)
+        cond_f = ttk.Combobox(top3, values=["الكل", "جديد", "مستعمل"], state="readonly", width=12)
+        cond_f.set("الكل")
+        cond_f.pack(side="right", padx=4)
         dest_var = tk.StringVar(value="")
         ttk.Label(tab1, textvariable=dest_var, style="Muted.TLabel").pack(anchor="e", pady=2)
         if can_see_sup and not reps:
@@ -6484,6 +6611,9 @@ class App(tk.Tk):
             if stock_lim is not None:
                 sql += " AND COALESCE(i.qty,0)<=?"
                 params.append(stock_lim)
+            if cond_f.get() != "الكل":
+                sql += " AND UPPER(COALESCE(i.condition,'NEW'))=?"
+                params.append("NEW" if cond_f.get() == "جديد" else "USED")
             sql += " ORDER BY i.item_no LIMIT 300"
             with connect() as c:
                 rows = c.execute(sql, params).fetchall()
@@ -6725,6 +6855,8 @@ class App(tk.Tk):
             make_f.set("الكل")
             model_f.configure(values=["الكل"])
             model_f.set("الكل")
+            stock_f.set("الكل")
+            cond_f.set("الكل")
             load_items()
 
         ttk.Button(top2, text="مسح الفلاتر", command=reset_filters).pack(side="left", padx=4)
@@ -6745,6 +6877,7 @@ class App(tk.Tk):
         if show_cost:
             av.bind("<<TreeviewSelect>>", show_sel_info, add="+")
         stock_f.bind("<<ComboboxSelected>>", load_items)
+        cond_f.bind("<<ComboboxSelected>>", load_items)
         rep_cb.bind("<<ComboboxSelected>>", on_rep)
         flt.bind("<KeyRelease>", load_items)
         lt.bind("<Double-1>", edit_qty)
