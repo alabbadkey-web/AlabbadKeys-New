@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.6.1"
+APP_VERSION = "16.7.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -37,7 +37,8 @@ PERMS = [
     ("sell_wholesale", "البيع بالجملة", False),
     ("below_price", "البيع بأقل من الحد المسموح", False),
     ("sales_all", "رؤية مبيعات كل الموظفين", False),
-    ("returns", "إلغاء الفواتير وتسجيل المرتجعات", False),
+    ("returns", "إرجاع الأصناف من الفواتير (جزئي أو كامل)", True),
+    ("void_invoice", "إلغاء فاتورة كاملة (بدون حذفها)", False),
     ("whatsapp", "إرسال الفاتورة واتساب", True),
     ("customers", "صفحة العملاء والديون", False),
     ("debt_pay", "تسجيل دفعات الديون", False),
@@ -81,6 +82,10 @@ SEED_CARS = {
 SEED_JOBS = ["برمجة سيارة داخل العمل", "برمجة سيارة خارج العمل", "دوام أوفر تايم"]
 
 STATUS_AR = {"pending": "⏳ بانتظار الاعتماد", "approved": "✅ معتمد", "rejected": "❌ مرفوض"}
+
+# فلتر الكمية المتوفرة (صفحة طلب الشراء والنواقص)
+STOCK_FILTERS = ["الكل", "نافد (0)", "2 أو أقل", "5 أو أقل", "10 أو أقل"]
+STOCK_FILTER_LIMITS = {"نافد (0)": 0, "2 أو أقل": 2, "5 أو أقل": 5, "10 أو أقل": 10}
 
 
 def connect():
@@ -595,6 +600,13 @@ def init():
         ucols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
         if "perms" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN perms TEXT")
+
+        # الموظفون القدامى: نمنحهم صلاحية الإرجاع مرة واحدة (كانت للمدير فقط)
+        if not c.execute("SELECT 1 FROM settings WHERE k='returns_perm_granted'").fetchone():
+            for u in c.execute("SELECT username,perms FROM users WHERE COALESCE(role,'')<>'admin' AND perms IS NOT NULL").fetchall():
+                c.execute("UPDATE users SET perms=? WHERE username=?",
+                          (perms_to_str(str_to_perms(u["perms"]) | {"returns"}), u["username"]))
+            c.execute("INSERT OR IGNORE INTO settings(k,v) VALUES('returns_perm_granted','1')")
 
         # ---- المبيعات
         cols = {r[1] for r in c.execute("PRAGMA table_info(sales)").fetchall()}
@@ -1921,6 +1933,49 @@ class App(tk.Tk):
     def can(self, key):
         return self.role == "admin" or key in self.perms
 
+    def can_see_supplier(self):
+        """اسم المورد لا يظهر للموظف إلا إذا أُعطي صلاحية (الموردون وبياناتهم)."""
+        return self.role == "admin" or self.can("suppliers")
+
+    def photo_box(self, parent, size=(170, 170), hint="اضغط الصورة للتكبير"):
+        """صندوق صورة المنتج: يعرض صورة الصنف، والضغط عليها يكبّرها للتأكد من القطعة."""
+        box = ttk.Frame(parent)
+        holder = tk.Frame(box, width=size[0] + 8, height=size[1] + 8, bg="white",
+                          highlightbackground=BORDER, highlightthickness=1)
+        holder.pack()
+        try:
+            holder.pack_propagate(False)
+        except Exception:
+            pass
+        lbl = tk.Label(holder, text="📷\nلا توجد صورة", bg="white", fg=MUTED, cursor="hand2")
+        lbl.pack(expand=True)
+        ttk.Label(box, text=hint, style="Muted.TLabel").pack(pady=(2, 0))
+        ref = {"img": None, "id": None}
+
+        def show(name, item_id=None):
+            ref["img"] = None
+            ref["id"] = item_id
+            lbl.configure(image="", text="📷\nلا توجد صورة", fg=MUTED)
+            path = image_path(name) if name else ""
+            if path and os.path.exists(path):
+                ph = load_photo(path, size)
+                if ph:
+                    ref["img"] = ph
+                    lbl.configure(image=ph, text="")
+                else:
+                    lbl.configure(text="📷\nتعذّر عرض الصورة")
+
+        def enlarge(_e=None):
+            if ref["id"]:
+                self.view_image(int(ref["id"]))
+            elif ref["img"]:
+                messagebox.showinfo("الصورة", "هذه صورة المنتج المصغّرة.", parent=parent)
+            else:
+                messagebox.showinfo("الصورة", "لا توجد صورة لهذا الصنف. أضفها من (تعديل الصنف).", parent=parent)
+
+        lbl.bind("<Button-1>", enlarge)
+        return box, show
+
     def center(self, win, w, h):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -2909,19 +2964,21 @@ class App(tk.Tk):
         line("ملاحظات", notes)
 
         if editing:
-            info = ttk.LabelFrame(frame, text="آخر تعديل وموردو الصنف (تكلفة كل مورد)", padding=8)
+            show_sup = self.can_see_supplier()
+            info = ttk.LabelFrame(frame, text="آخر تعديل" + (" وموردو الصنف (تكلفة كل مورد)" if show_sup else ""), padding=8)
             info.grid(row=counter[0], column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 4))
             counter[0] += 1
             ttk.Label(info, text=f"آخر تعديل: {val('updated_by') or '—'}   —   {val('updated_at') or '—'}",
                       foreground=MUTED).pack(anchor="e")
-            with connect() as c_:
-                scrows = supplier_costs(c_, row["id"])
-            if scrows:
-                for sc in scrows:
-                    ttk.Label(info, text=f"• {sc['supplier']}: تكلفة {sar(num(sc['cost']) + num(sc['expense']))}   (آخر شراء: {sc['updated_at'] or '—'})").pack(anchor="e")
-            else:
-                ttk.Label(info, text="لا توجد مشتريات مسجلة بعد — تُحفظ تكلفة كل مورد تلقائيًا عند استلام فاتورة الشراء.",
-                          foreground=MUTED).pack(anchor="e")
+            if show_sup:
+                with connect() as c_:
+                    scrows = supplier_costs(c_, row["id"])
+                if scrows:
+                    for sc in scrows:
+                        ttk.Label(info, text=f"• {sc['supplier']}: تكلفة {sar(num(sc['cost']) + num(sc['expense']))}   (آخر شراء: {sc['updated_at'] or '—'})").pack(anchor="e")
+                else:
+                    ttk.Label(info, text="لا توجد مشتريات مسجلة بعد — تُحفظ تكلفة كل مورد تلقائيًا عند استلام فاتورة الشراء.",
+                              foreground=MUTED).pack(anchor="e")
 
         def save():
             d = {
@@ -3566,7 +3623,7 @@ class App(tk.Tk):
             phone.delete(0, "end")
             phone.insert(0, r_["phone"] or "")
             sug.grid_remove()
-            item_sel.focus_set()
+            search_e.focus_set()
 
         def to_list(_e=None):
             if sug.winfo_ismapped() and sug.size():
@@ -3584,64 +3641,202 @@ class App(tk.Tk):
         sug.bind("<Return>", pick_sug)
         sug.bind("<Escape>", hide_sug)
 
-        item_frame = ttk.LabelFrame(self.body, text="إضافة الأصناف", padding=8)
+        item_frame = ttk.LabelFrame(self.body, text="إضافة الأصناف — اكتب اسم الصنف أو رقمه وستظهر الخيارات", padding=8)
         item_frame.pack(fill="x", pady=5)
+
+        # ---------- فلاتر نوع القطعة والسيارة
+        filters = ttk.Frame(item_frame)
+        filters.pack(fill="x", pady=(0, 4))
         with connect() as c:
-            items = c.execute("SELECT id,item_no,part,car,qty,retail,buy,expense,profit,condition,origin FROM items WHERE qty>0 ORDER BY item_no").fetchall()
-        item_map = {}
-        options = []
-        for r in items:
-            label = f"{r['item_no']} | {r['part']} | {r['car']} | {'مستعمل' if r['condition'] == 'USED' else 'جديد'}{(' | ' + r['origin']) if r['origin'] else ''} | المتوفر {r['qty']}"
-            options.append(label)
-            item_map[label] = r
-        with connect() as c:  # المنتجات المركّبة تظهر في نفس القائمة
-            for b in c.execute("SELECT * FROM bundles WHERE COALESCE(active,1)=1 ORDER BY code").fetchall():
-                comps = bundle_components(c, b["id"])
-                avail = bundle_available(comps)
-                if avail <= 0:
-                    continue
-                label = f"{b['code']} | 🎁 {b['name']} | مركّب | المتوفر {avail}"
-                options.append(label)
-                item_map[label] = {"id": f"B{b['id']}", "bundle_id": b["id"], "item_no": b["code"], "part": b["name"], "car": "منتج مركّب",
-                                   "qty": avail, "retail": num(b["retail"]),
-                                   "buy": sum(num(x["buy"]) * x["comp_qty"] for x in comps),
-                                   "expense": sum(num(x["expense"]) * x["comp_qty"] for x in comps),
-                                   "profit": 0, "condition": "NEW", "origin": "", "w_min": bundle_wholesale(comps)}
-        ttk.Label(item_frame, text="الصنف").grid(row=0, column=5, padx=4)
-        item_sel = ttk.Combobox(item_frame, values=options, width=46, state="readonly")
-        item_sel.grid(row=0, column=4, padx=4)
-        ttk.Label(item_frame, text="الكمية").grid(row=0, column=3, padx=4)
-        qty = ttk.Entry(item_frame, width=8, justify="right")
+            type_vals = ["كل الأنواع"] + [r["name"] for r in c.execute("SELECT name FROM item_types ORDER BY name").fetchall()]
+            make_vals = ["كل الشركات"] + [r["name"] for r in c.execute("SELECT name FROM car_makes ORDER BY name").fetchall()]
+        ttk.Label(filters, text="نوع القطعة").pack(side="right", padx=4)
+        f_cat = ttk.Combobox(filters, values=type_vals, state="readonly", width=14)
+        f_cat.set("كل الأنواع")
+        f_cat.pack(side="right", padx=4)
+        ttk.Label(filters, text="السيارة").pack(side="right", padx=4)
+        f_make = ttk.Combobox(filters, values=make_vals, state="readonly", width=13)
+        f_make.set("كل الشركات")
+        f_make.pack(side="right", padx=4)
+        ttk.Label(filters, text="الموديل").pack(side="right", padx=4)
+        f_model = ttk.Combobox(filters, values=["كل الموديلات"], state="readonly", width=13)
+        f_model.set("كل الموديلات")
+        f_model.pack(side="right", padx=4)
+        found_count = tk.StringVar(value="")
+        ttk.Label(filters, textvariable=found_count, style="Muted.TLabel").pack(side="left", padx=6)
+
+        # ---------- البحث بالكتابة + الكمية والسعر والباركود
+        srow = ttk.Frame(item_frame)
+        srow.pack(fill="x")
+        ttk.Label(srow, text="بحث").pack(side="right", padx=4)
+        search_e = ttk.Entry(srow, width=32, justify="right")
+        search_e.pack(side="right", padx=4)
+        ttk.Label(srow, text="الكمية").pack(side="right", padx=4)
+        qty = ttk.Entry(srow, width=6, justify="center")
         qty.insert(0, "1")
-        qty.grid(row=0, column=2, padx=4)
-        ttk.Label(item_frame, text="نوع البيع").grid(row=0, column=1, padx=4)
+        qty.pack(side="right", padx=4)
+        ttk.Label(srow, text="نوع البيع").pack(side="right", padx=4)
         kinds = ["مفرد", "جملة"] if self.can("sell_wholesale") else ["مفرد"]
-        kind = ttk.Combobox(item_frame, values=kinds, state="readonly", width=10)
+        kind = ttk.Combobox(srow, values=kinds, state="readonly", width=9)
         kind.set("مفرد")
-        kind.grid(row=0, column=0, padx=4)
-        ttk.Label(item_frame, text="سعر الوحدة").grid(row=1, column=5, padx=4, pady=4)
-        price = ttk.Entry(item_frame, width=12, justify="right")
-        price.grid(row=1, column=4, padx=4)
-        ttk.Label(item_frame, text="باركود").grid(row=1, column=3, padx=4)
-        scan_e = ttk.Entry(item_frame, width=22, justify="right")
-        scan_e.grid(row=1, column=2, padx=4)
+        kind.pack(side="right", padx=4)
+        ttk.Label(srow, text="سعر الوحدة").pack(side="right", padx=4)
+        price = ttk.Entry(srow, width=11, justify="right")
+        price.pack(side="right", padx=4)
+        ttk.Label(srow, text="باركود").pack(side="right", padx=4)
+        scan_e = ttk.Entry(srow, width=16, justify="right")
+        scan_e.pack(side="right", padx=4)
+
+        main = ttk.Frame(item_frame)
+        main.pack(fill="both", expand=True, pady=(6, 0))
+        preview_box, set_preview = self.photo_box(main, (160, 160))
+        preview_box.pack(side="left", padx=(8, 0))
+        found_cols = ("item_no", "part", "car", "qty", "retail")
+        found_heads = {"item_no": "رقم الصنف", "part": "اسم الصنف / رقم القطعة", "car": "السيارة",
+                       "qty": "المتوفر", "retail": "سعر المفرد"}
+        found_t = make_tree(main, found_cols, found_heads,
+                            {"item_no": 115, "part": 320, "car": 165, "qty": 70, "retail": 95}, height=5)
+        found = {}
+
+        brow = ttk.Frame(item_frame)
+        brow.pack(fill="x", pady=4)
+        ttk.Button(brow, text="＋ إضافة للفاتورة", style="Accent.TButton", command=lambda: add_line()).pack(side="right", padx=4)
+        ttk.Button(brow, text="حذف السطر المحدد", command=lambda: remove_line()).pack(side="right", padx=4)
+        ttk.Label(brow, text="(اكتب جزءًا من الاسم أو الرقم، وانقر على الصورة للتكبير)",
+                  style="Muted.TLabel").pack(side="right", padx=6)
+
+        def load_found(*_):
+            term = search_e.get().strip()
+            with connect() as c:
+                where, params = ["1=1"], []
+                if term:
+                    like = "%" + term + "%"
+                    where.append("(COALESCE(i.item_no,'') LIKE ? OR COALESCE(i.part,'') LIKE ? OR COALESCE(i.car,'') LIKE ?"
+                                 " OR COALESCE(i.rep_code,'') LIKE ? OR COALESCE(i.make,'') LIKE ? OR COALESCE(i.model,'') LIKE ?"
+                                 " OR COALESCE(i.category,'') LIKE ? OR COALESCE(i.kind,'') LIKE ? OR COALESCE(i.notes,'') LIKE ?)")
+                    params += [like] * 9
+                if f_cat.get() != "كل الأنواع":
+                    where.append("COALESCE(i.category,'غير محدد')=?")
+                    params.append(f_cat.get())
+                if f_make.get() != "كل الشركات":
+                    where.append("i.make=?")
+                    params.append(f_make.get())
+                if f_model.get() != "كل الموديلات":
+                    where.append("i.model=?")
+                    params.append(f_model.get())
+                rows = c.execute("SELECT i.* FROM items i WHERE " + " AND ".join(where) +
+                                 " ORDER BY (COALESCE(i.qty,0)<=0), i.item_no LIMIT 150", params).fetchall()
+                bundles = []
+                if f_cat.get() == "كل الأنواع" and f_make.get() == "كل الشركات" and f_model.get() == "كل الموديلات":
+                    for b in c.execute("SELECT * FROM bundles WHERE COALESCE(active,1)=1 ORDER BY code").fetchall():
+                        if term and term.lower() not in (str(b["name"]) + " " + str(b["code"])).lower():
+                            continue
+                        comps = bundle_components(c, b["id"])
+                        avail = bundle_available(comps)
+                        if avail <= 0:
+                            continue
+                        bundles.append({"id": "B" + str(b["id"]), "bundle_id": b["id"], "item_no": b["code"],
+                                        "part": "🎁 " + b["name"], "car": "منتج مركّب", "qty": avail,
+                                        "retail": num(b["retail"]),
+                                        "buy": sum(num(x["buy"]) * x["comp_qty"] for x in comps),
+                                        "expense": sum(num(x["expense"]) * x["comp_qty"] for x in comps),
+                                        "profit": 0, "condition": "NEW", "origin": "", "image": "",
+                                        "w_min": bundle_wholesale(comps), "category": "منتج مركّب"})
+            clear_tree(found_t)
+            found.clear()
+            for r in bundles + rows:
+                iid = str(r["id"])
+                found[iid] = r
+                q_ = int(num(r["qty"]))
+                extra = ("out",) if q_ <= 0 else (("low",) if q_ <= 2 else ())
+                add_row(found_t, (r["item_no"], r["part"], r["car"] or "—", q_, sar(r["retail"])), iid=iid, extra=extra)
+            found_count.set(f"{len(found)} نتيجة")
+
+        def current_item():
+            sel = found_t.selection()
+            return found.get(sel[0]) if sel else None
+
+        def select_item(*_):
+            r = current_item()
+            if not r:
+                return
+            price.delete(0, "end")
+            price.insert(0, str(min_price_of(r, kind.get())))
+            is_bundle = isinstance(r, dict) and r.get("bundle_id")
+            set_preview(r["image"], None if is_bundle else int(r["id"]))
+
+        def on_make(_e=None):
+            models = ["كل الموديلات"]
+            if f_make.get() != "كل الشركات":
+                with connect() as c:
+                    models += [r["name"] for r in c.execute(
+                        "SELECT m.name FROM car_models m JOIN car_makes k ON k.id=m.make_id WHERE k.name=? ORDER BY m.name",
+                        (f_make.get(),)).fetchall()]
+            f_model.configure(values=models)
+            f_model.set("كل الموديلات")
+            load_found()
+
+        def reset_filters():
+            f_cat.set("كل الأنواع")
+            f_make.set("كل الشركات")
+            f_model.configure(values=["كل الموديلات"])
+            f_model.set("كل الموديلات")
+            search_e.delete(0, "end")
+            load_found()
 
         def scan(_e=None):
-            bm = parse_barcode(scan_e.get())
-            code = bm[0] if bm else scan_e.get().strip().upper()
-            with connect() as c_:
-                al_ = c_.execute("SELECT i.item_no FROM item_aliases a JOIN items i ON i.id=a.item_id WHERE UPPER(a.code)=? LIMIT 1", (code,)).fetchone()
-            for want in [code] + ([(al_["item_no"] or "").upper()] if al_ else []):
-                for label, r_ in item_map.items():
-                    if (r_["item_no"] or "").upper() == want:
-                        item_sel.set(label)
-                        select_item()
-                        scan_e.delete(0, "end")
-                        qty.focus_set()
-                        return
-            messagebox.showwarning("تنبيه", "الباركود غير موجود، أو الصنف نافد من المخزون")
+            raw = scan_e.get().strip()
+            if not raw:
+                return
+            bm = parse_barcode(raw)
+            code = (bm[0] if bm else raw).upper()
+            row_item = bundle_item = None
+            with connect() as c:
+                target = None
+                al = c.execute("SELECT item_id FROM item_aliases WHERE UPPER(code)=? LIMIT 1", (code,)).fetchone()
+                if al:
+                    target = al["item_id"]
+                else:
+                    for col in ("item_no", "rep_code", "part"):
+                        rr = c.execute(f"SELECT id FROM items WHERE UPPER(COALESCE({col},''))=? LIMIT 1", (code,)).fetchone()
+                        if rr:
+                            target = rr["id"]
+                            break
+                if target:
+                    row_item = c.execute("SELECT * FROM items WHERE id=?", (target,)).fetchone()
+                else:
+                    bb = c.execute("SELECT id FROM bundles WHERE UPPER(COALESCE(code,''))=? LIMIT 1", (code,)).fetchone()
+                    if bb:
+                        b = c.execute("SELECT * FROM bundles WHERE id=?", (bb["id"],)).fetchone()
+                        comps = bundle_components(c, bb["id"])
+                        bundle_item = {"id": "B" + str(bb["id"]), "bundle_id": bb["id"], "item_no": b["code"],
+                                       "part": "🎁 " + b["name"], "car": "منتج مركّب", "qty": bundle_available(comps),
+                                       "retail": num(b["retail"]),
+                                       "buy": sum(num(x["buy"]) * x["comp_qty"] for x in comps),
+                                       "expense": sum(num(x["expense"]) * x["comp_qty"] for x in comps),
+                                       "profit": 0, "condition": "NEW", "image": "",
+                                       "w_min": bundle_wholesale(comps)}
+            r_ = row_item or bundle_item
+            if not r_:
+                messagebox.showwarning("تنبيه", "الباركود غير موجود في المخزون")
+                return
+            price.delete(0, "end")
+            price.insert(0, str(min_price_of(r_, kind.get())))
+            add_line(r_, max(1, int(num(qty.get()))))
+            scan_e.delete(0, "end")
+            update_total()
+            search_e.focus_set()
 
+        ttk.Button(filters, text="مسح الفلاتر", command=reset_filters).pack(side="right", padx=6)
+        search_e.bind("<KeyRelease>", lambda e: load_found())
+        f_cat.bind("<<ComboboxSelected>>", lambda e: load_found())
+        f_make.bind("<<ComboboxSelected>>", on_make)
+        f_model.bind("<<ComboboxSelected>>", lambda e: load_found())
+        kind.bind("<<ComboboxSelected>>", select_item)
+        found_t.bind("<<TreeviewSelect>>", select_item)
+        found_t.bind("<Double-1>", lambda e: add_line())
         scan_e.bind("<Return>", scan)
+        load_found()
 
         invoice_items = []
         invoice_frame = ttk.LabelFrame(self.body, text="أصناف الفاتورة", padding=8)
@@ -3658,12 +3853,13 @@ class App(tk.Tk):
             return sum(x["qty"] * x["price"] for x in invoice_items)
 
         def refresh_paid():
-            # في الكاش: المدفوع = الإجمالي دائمًا ولا يُعدّل
-            if pay_type.get() == "كاش":
-                paid.configure(state="normal")
-                paid.delete(0, "end")
-                paid.insert(0, f"{invoice_total():.2f}")
-                paid.configure(state="disabled")
+            # الكاش والبطاقة: المدفوع = الإجمالي دائمًا ولا يُعدّل (الدين يُكتب يدويًا)
+            if pay_type.get() == "دين":
+                return
+            paid.configure(state="normal")
+            paid.delete(0, "end")
+            paid.insert(0, f"{invoice_total():.2f}")
+            paid.configure(state="disabled")
 
         def on_pay_change():
             if pay_type.get() == "دين":
@@ -3682,20 +3878,10 @@ class App(tk.Tk):
                 return num(r["w_min"]) if k == "جملة" else num(r["retail"])
             return wholesale_price(r["buy"], r["expense"], r["profit"]) if k == "جملة" else num(r["retail"])
 
-        def select_item(*_):
-            r = item_map.get(item_sel.get())
+        def add_line(r=None):
+            r = r or current_item()
             if not r:
-                return
-            price.delete(0, "end")
-            price.insert(0, str(min_price_of(r, kind.get())))
-
-        item_sel.bind("<<ComboboxSelected>>", select_item)
-        kind.bind("<<ComboboxSelected>>", select_item)
-
-        def add_line():
-            r = item_map.get(item_sel.get())
-            if not r:
-                messagebox.showwarning("تنبيه", "اختر الصنف أولًا")
+                messagebox.showwarning("تنبيه", "اختر الصنف من نتائج البحث أولًا")
                 return
             qn = int(num(qty.get()))
             pn = num(price.get())
@@ -3727,18 +3913,17 @@ class App(tk.Tk):
             invoice_items.pop(idx)
             update_total()
 
-        ttk.Button(item_frame, text="＋ إضافة للفاتورة", style="Accent.TButton", command=add_line).grid(row=1, column=0, padx=4)
-        ttk.Button(item_frame, text="حذف السطر المحدد", command=remove_line).grid(row=1, column=1, padx=4)
 
         payment_frame = ttk.LabelFrame(bottom, text="الدفع", padding=8)
         payment_frame.pack(fill="x", pady=4)
-        ttk.Label(payment_frame, text="طريقة الدفع").grid(row=0, column=5, padx=4)
-        ttk.Radiobutton(payment_frame, text="كاش", variable=pay_type, value="كاش", command=on_pay_change).grid(row=0, column=4, padx=4)
-        ttk.Radiobutton(payment_frame, text="دين", variable=pay_type, value="دين", command=on_pay_change).grid(row=0, column=3, padx=4)
-        ttk.Label(payment_frame, text="المدفوع الآن").grid(row=0, column=2, padx=4)
+        ttk.Label(payment_frame, text="طريقة الدفع").grid(row=0, column=7, padx=4)
+        ttk.Radiobutton(payment_frame, text="كاش", variable=pay_type, value="كاش", command=on_pay_change).grid(row=0, column=6, padx=4)
+        ttk.Radiobutton(payment_frame, text="بطاقة", variable=pay_type, value="بطاقة", command=on_pay_change).grid(row=0, column=5, padx=4)
+        ttk.Radiobutton(payment_frame, text="دين", variable=pay_type, value="دين", command=on_pay_change).grid(row=0, column=4, padx=4)
+        ttk.Label(payment_frame, text="المدفوع الآن").grid(row=0, column=3, padx=4)
         paid = ttk.Entry(payment_frame, width=14, justify="right")
-        paid.grid(row=0, column=1, padx=4)
-        ttk.Label(payment_frame, text="(في الدين: اكتب المدفوع إن وُجد، أو اتركه 0)", style="Muted.TLabel").grid(row=0, column=0, padx=4)
+        paid.grid(row=0, column=2, padx=4)
+        ttk.Label(payment_frame, text="(في الدين: اكتب المدفوع إن وُجد، أو اتركه 0)", style="Muted.TLabel").grid(row=0, column=0, columnspan=2, padx=4)
         on_pay_change()
 
         def save_invoice():
@@ -3753,7 +3938,7 @@ class App(tk.Tk):
             total = invoice_total()
             ptype = pay_type.get()
 
-            if ptype == "كاش":
+            if ptype in ("كاش", "بطاقة"):
                 paid_now = total
             else:
                 paid_now = num(paid.get())
@@ -3761,7 +3946,7 @@ class App(tk.Tk):
                     messagebox.showwarning("تنبيه", "فاتورة الدين تحتاج اسم العميل أو رقم جواله")
                     return
                 if paid_now < 0 or paid_now >= total - 0.001:
-                    messagebox.showwarning("تنبيه", "في الدين لازم يكون المدفوع أقل من إجمالي الفاتورة. إذا دفع كامل المبلغ اختر كاش")
+                    messagebox.showwarning("تنبيه", "في الدين لازم يكون المدفوع أقل من إجمالي الفاتورة. إذا دفع كامل المبلغ اختر كاش أو بطاقة")
                     return
 
             below = []
@@ -3797,7 +3982,7 @@ class App(tk.Tk):
                 remaining_paid = paid_now
                 for ro in rows_out:
                     line_total = ro["qty"] * ro["price"]
-                    if ptype == "كاش":
+                    if ptype in ("كاش", "بطاقة"):
                         line_paid = line_total
                     else:
                         line_paid = min(line_total, remaining_paid)
@@ -3904,6 +4089,7 @@ class App(tk.Tk):
         if not voided and self.can("returns"):
             ttk.Button(bar, text="↩ إرجاع صنف / أصناف", style="Accent.TButton",
                        command=lambda: self.invoice_return_dialog(invoice_no, win)).pack(side="right", padx=4)
+        if not voided and (self.role == "admin" or self.can("void_invoice")):
             ttk.Button(bar, text="🚫 إلغاء الفاتورة", style="Danger.TButton",
                        command=lambda: self.invoice_void_dialog(invoice_no, win)).pack(side="right", padx=4)
         if self.can("whatsapp") and not voided:
@@ -3979,7 +4165,7 @@ class App(tk.Tk):
         self.autosize(dlg, fr, 880)
 
     def invoice_void_dialog(self, invoice_no, parent=None):
-        if not self.can("returns"):
+        if not (self.role == "admin" or self.can("void_invoice")):
             return
         reason = simpledialog.askstring("إلغاء الفاتورة", f"سبب إلغاء الفاتورة {invoice_no} (إجباري):", parent=parent or self)
         if reason is None:
@@ -5621,16 +5807,18 @@ class App(tk.Tk):
         if not item_ids:
             messagebox.showwarning("تنبيه", "لا توجد أصناف لإرسالها", parent=parent or self)
             return
-        text = self.shortage_message(item_ids)
+        text = self.shortage_message(item_ids, include_supplier=self.can_see_supplier())
         phone = normalize_phone(setting("purchasing_phone"))
+        if len(phone) < 9 and self.role != "admin":
+            messagebox.showwarning("تنبيه", "رقم مسؤول المشتريات يحدده المدير من الإعدادات. اطلب منه إضافته.", parent=parent or self)
+            return
         if len(phone) < 9:
             ph = simpledialog.askstring("مسؤول المشتريات", "رقم واتساب مسؤول المشتريات:", parent=parent or self) or ""
             phone = normalize_phone(ph)
             if len(phone) < 9:
                 messagebox.showwarning("تنبيه", "رقم الجوال غير صحيح", parent=parent or self)
                 return
-            if self.role == "admin":
-                setsetting("purchasing_phone", phone)
+            setsetting("purchasing_phone", phone)
         self._open_whatsapp(phone, text, parent)
 
     def set_min_qty(self, table):
@@ -5802,14 +5990,15 @@ class App(tk.Tk):
         redraw()
         self.dialog_size(win, body, bar, 700)
 
-    def shortage_message(self, item_ids, need=None):
+    def shortage_message(self, item_ids, need=None, include_supplier=True):
         need = need or {}
         ids = [int(i) for i in item_ids]
         if not ids:
             return ""
         with connect() as c:
             marks = ",".join("?" * len(ids))
-            rows = c.execute(f"SELECT * FROM items WHERE id IN ({marks}) ORDER BY COALESCE(NULLIF(supplier,''),'~'), item_no", ids).fetchall()
+            order = "COALESCE(NULLIF(supplier,''),'~'), item_no" if include_supplier else "item_no"
+            rows = c.execute(f"SELECT * FROM items WHERE id IN ({marks}) ORDER BY {order}", ids).fetchall()
         RLM = "\u200f"
         sep = "━━━━━━━━━━━━━━"
         out = []
@@ -5827,7 +6016,7 @@ class App(tk.Tk):
         current = object()
         for r in rows:
             rep_name = r["supplier"] or ""
-            if rep_name != current:
+            if include_supplier and rep_name != current:
                 current = rep_name
                 add()
                 add(sep)
@@ -5859,14 +6048,17 @@ class App(tk.Tk):
         ttk.Label(body, text="نواقص المخزون", style="Title.TLabel").pack(anchor="e")
         ttk.Label(body, text="اختر المورد لتجمع نواقصه برموز منتجاته عنده. حدّد صفوفًا معينة لإرسالها فقط، أو اتركها بدون تحديد لإرسال الكل.", style="Sub.TLabel").pack(anchor="e")
 
+        can_see_sup = self.can_see_supplier()
         with connect() as c:
-            reps = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()]
+            reps = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()] if can_see_sup else []
         top = ttk.LabelFrame(body, text="التصفية", padding=10)
         top.pack(fill="x", pady=8)
-        ttk.Label(top, text="المورد").grid(row=0, column=5, padx=6)
+        if can_see_sup:
+            ttk.Label(top, text="المورد").grid(row=0, column=5, padx=6)
         rep_cb = ttk.Combobox(top, values=["الكل", "بدون مورد"] + reps, state="readonly", width=24)
         rep_cb.set(rep if rep in reps else "الكل")
-        rep_cb.grid(row=0, column=4, padx=6)
+        if can_see_sup:
+            rep_cb.grid(row=0, column=4, padx=6)
         ttk.Label(top, text="الكمية أقل من أو تساوي").grid(row=0, column=3, padx=6)
         thr = ttk.Entry(top, width=6, justify="center")
         thr.insert(0, "0")
@@ -5876,7 +6068,7 @@ class App(tk.Tk):
         officer_var = tk.StringVar(value="")
         count_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=officer_var, style="Muted.TLabel").pack(anchor="e")
-        cols = ("item_no", "part", "car", "category", "qty", "need", "rep", "rep_code")
+        cols = ("item_no", "part", "car", "category", "qty", "need") + (("rep", "rep_code") if can_see_sup else ())
         t = make_tree(body, cols, {"item_no": "رقم الصنف", "part": "رقم القطعة", "car": "السيارة", "category": "النوع", "qty": "المتوفر",
                                    "need": "المطلوب", "rep": "المورد", "rep_code": "رمز المنتج عند المورد"},
                       {"car": 160, "rep": 150, "rep_code": 190, "item_no": 120})
@@ -5895,19 +6087,21 @@ class App(tk.Tk):
                 limit = 0
             sql = "SELECT * FROM items WHERE COALESCE(qty,0)<=?"
             params = [limit]
-            if rep_cb.get() == "بدون مورد":
+            if can_see_sup and rep_cb.get() == "بدون مورد":
                 sql += " AND COALESCE(supplier,'')=''"
-            elif rep_cb.get() != "الكل":
+            elif can_see_sup and rep_cb.get() != "الكل":
                 sql += " AND supplier=?"
                 params.append(rep_cb.get())
-            sql += " ORDER BY COALESCE(NULLIF(supplier,''),'~'), item_no"
+            sql += (" ORDER BY COALESCE(NULLIF(supplier,''),'~'), item_no" if can_see_sup else " ORDER BY item_no")
             with connect() as c:
                 rows = c.execute(sql, params).fetchall()
             clear_tree(t)
             for r in rows:
                 q_ = r["qty"] or 0
-                add_row(t, (r["item_no"], r["part"], r["car"], r["category"], q_, need.get(str(r["id"]), ""), r["supplier"] or "", r["rep_code"] or ""),
-                        iid=str(r["id"]), extra=("out",) if q_ <= 0 else ("low",))
+                vals = [r["item_no"], r["part"], r["car"], r["category"], q_, need.get(str(r["id"]), "")]
+                if can_see_sup:
+                    vals += [r["supplier"] or "", r["rep_code"] or ""]
+                add_row(t, tuple(vals), iid=str(r["id"]), extra=("out",) if q_ <= 0 else ("low",))
             count_var.set(f"عدد الأصناف: {len(rows)}   (انقر مرتين على صنف لتحديد الكمية المطلوبة منه)")
 
         def current_ids():
@@ -5933,7 +6127,7 @@ class App(tk.Tk):
                 messagebox.showwarning("تنبيه", "لا توجد أصناف", parent=win)
                 return
             self.clipboard_clear()
-            self.clipboard_append(self.shortage_message(ids, need))
+            self.clipboard_append(self.shortage_message(ids, need, include_supplier=can_see_sup))
             messagebox.showinfo("تم", "تم نسخ القائمة. الصقها في أي محادثة (Ctrl+V).", parent=win)
 
         def send():
@@ -5941,17 +6135,19 @@ class App(tk.Tk):
             if not ids:
                 messagebox.showwarning("تنبيه", "لا توجد أصناف لإرسالها", parent=win)
                 return
-            text = self.shortage_message(ids, need)
+            text = self.shortage_message(ids, need, include_supplier=can_see_sup)
             phone = normalize_phone(setting("purchasing_phone"))
+            if len(phone) < 9 and self.role != "admin":
+                messagebox.showwarning("تنبيه", "رقم مسؤول المشتريات يحدده المدير من الإعدادات. اطلب منه إضافته.", parent=win)
+                return
             if len(phone) < 9:
                 ph = simpledialog.askstring("مسؤول المشتريات", "رقم واتساب مسؤول المشتريات:", parent=win) or ""
                 phone = normalize_phone(ph)
                 if len(phone) < 9:
                     messagebox.showwarning("تنبيه", "رقم الجوال غير صحيح", parent=win)
                     return
-                if self.role == "admin":
-                    setsetting("purchasing_phone", phone)
-                    refresh_officer()
+                setsetting("purchasing_phone", phone)
+                refresh_officer()
             enc = urllib.parse.quote(text)
             if len(enc) > 1900:
                 # رابط واتساب له حد للطول: نسخ القائمة ونفتح المحادثة فقط
@@ -6135,7 +6331,10 @@ class App(tk.Tk):
         self.clear("po")
         is_admin = self.role == "admin"
         show_cost = self.can("view_cost")
-        self.page_title("طلب شراء من المورد", "اختر المورد ← أضف الأصناف والكميات ← أصدر الطلب وأرسله واتساب")
+        can_see_sup = self.can_see_supplier()
+        self.page_title("طلب شراء من المورد",
+                        "اختر المورد ← أضف الأصناف والكميات ← أصدر الطلب وأرسله واتساب" if can_see_sup
+                        else "أضف الأصناف والكميات ← أصدر الطلب ليصل لمسؤول المشتريات ويختار المورد")
         nb = ttk.Notebook(self.body)
         nb.pack(fill="both", expand=True)
         tab1 = ttk.Frame(nb, padding=10)
@@ -6155,20 +6354,23 @@ class App(tk.Tk):
         ttk.Label(bar, textvariable=total_var, font=(FONT, 12, "bold"), foreground=NAVY).pack(anchor="e", pady=2)
         brow = ttk.Frame(bar)
         brow.pack(fill="x", pady=4)
-        issue_text = "📤  إصدار طلب الشراء وإرساله للمورد (واتساب)" if is_admin else "📤  إصدار الطلب وإرساله لجوال المدير (واتساب)"
+        issue_text = "📤  إصدار طلب الشراء وإرساله للمورد (واتساب)" if is_admin else "📤  إصدار الطلب وإرساله لجوال مسؤول المشتريات (واتساب)"
         ttk.Button(brow, text=issue_text, style="Success.TButton", command=lambda: issue()).pack(side="right", ipadx=16, ipady=5)
         if is_admin:
             ttk.Button(brow, text="⚙ جوال المدير لاستلام طلبات الموظفين", command=lambda: self.manager_phone_dialog(refresh_dest)).pack(side="left")
 
         with connect() as c:
-            reps = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()]
+            reps = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()] if can_see_sup else []
         top = ttk.Frame(tab1)
         top.pack(fill="x")
-        ttk.Label(top, text="المورد").pack(side="right", padx=4)
+        if can_see_sup:
+            ttk.Label(top, text="المورد").pack(side="right", padx=4)
         rep_cb = ttk.Combobox(top, values=reps, state="readonly", width=26)
-        rep_cb.pack(side="right", padx=4)
-        all_var = tk.IntVar(value=0)
-        ttk.Checkbutton(top, text="إظهار كل الأصناف (حتى من موردين آخرين)", variable=all_var, command=lambda: load_items()).pack(side="right", padx=12)
+        if can_see_sup:
+            rep_cb.pack(side="right", padx=4)
+        all_var = tk.IntVar(value=0 if can_see_sup else 1)
+        if can_see_sup:
+            ttk.Checkbutton(top, text="إظهار كل الأصناف (حتى من موردين آخرين)", variable=all_var, command=lambda: load_items()).pack(side="right", padx=12)
         ttk.Label(top, text="بحث").pack(side="right", padx=4)
         flt = ttk.Entry(top, width=18, justify="right")
         flt.pack(side="right", padx=4)
@@ -6190,16 +6392,24 @@ class App(tk.Tk):
         model_f = ttk.Combobox(top2, values=["الكل"], state="readonly", width=16)
         model_f.set("الكل")
         model_f.pack(side="right", padx=4)
+        ttk.Label(top2, text="الكمية المتوفرة").pack(side="right", padx=4)
+        stock_f = ttk.Combobox(top2, values=STOCK_FILTERS, state="readonly", width=11)
+        stock_f.set("الكل")
+        stock_f.pack(side="right", padx=4)
         dest_var = tk.StringVar(value="")
         ttk.Label(tab1, textvariable=dest_var, style="Muted.TLabel").pack(anchor="e", pady=2)
-        if not reps:
+        if can_see_sup and not reps:
             ttk.Label(tab1, text="لا يوجد موردون مسجّلون. أضفهم من صفحة (الموردون) أولًا.", foreground=AMBER).pack(anchor="e")
 
         ttk.Label(tab1, text="أصناف المورد — انقر مرتين على الصنف لتحديد الكمية وإضافته للطلب", font=(FONT, 11, "bold")).pack(anchor="e")
         av_cols = ("item_no", "name", "part", "code", "qty") + (("cost",) if show_cost else ())
         av_heads = {"item_no": "رقم الصنف", "name": "اسم المنتج", "part": "رقم القطعة",
                     "code": "رقم المنتج عند المورد", "qty": "المتوفر", "cost": "آخر تكلفة"}
-        av = make_tree(tab1, av_cols, av_heads, {"name": 280, "code": 165, "cost": 120}, height=5)
+        avwrap = ttk.Frame(tab1)
+        avwrap.pack(fill="both", expand=True)
+        po_box, po_set_preview = self.photo_box(avwrap, (150, 150))
+        po_box.pack(side="left", padx=(6, 0))
+        av = make_tree(avwrap, av_cols, av_heads, {"name": 280, "code": 165, "cost": 120}, height=5)
         av.configure(selectmode="extended")
         addrow = ttk.Frame(tab1)
         addrow.pack(fill="x", pady=4)
@@ -6208,7 +6418,8 @@ class App(tk.Tk):
         qty_e.insert(0, "1")
         qty_e.pack(side="right", padx=4)
         ttk.Button(addrow, text="＋ إضافة المحدد للطلب", style="Accent.TButton", command=lambda: add_selected()).pack(side="right", padx=6)
-        ttk.Button(addrow, text="＋ إضافة نواقص المورد", command=lambda: add_shortage()).pack(side="right", padx=6)
+        ttk.Button(addrow, text=("＋ إضافة نواقص المورد" if can_see_sup else "＋ إضافة الأصناف الناقصة"),
+                   command=lambda: add_shortage()).pack(side="right", padx=6)
         if show_cost:
             ttk.Button(addrow, text="⚖ مقارنة الموردين والأسعار", style="Success.TButton",
                        command=lambda: compare_selected()).pack(side="right", padx=6)
@@ -6242,7 +6453,7 @@ class App(tk.Tk):
                 dest_var.set(f"سيُرسل مباشرة إلى المورد: {rep_cb.get() or '—'}   |   جواله: {phone or 'غير مسجّل (سأطلبه منك عند الإرسال)'}")
             else:
                 mp = setting("manager_phone")
-                dest_var.set(f"سيُرسل إلى جوال المدير ({mp or 'غير محدد — اطلب من المدير إضافته'}) ليراجعه ويرسله للمورد")
+                dest_var.set(f"سيُرسل إلى جوال مسؤول المشتريات ({mp or 'الرقم يحدده المدير من الإعدادات'}) ليختار المورد ويرسله")
 
         def load_items(*_):
             clear_tree(av)
@@ -6269,6 +6480,10 @@ class App(tk.Tk):
             if model_f.get() != "الكل":
                 sql += " AND i.model=?"
                 params.append(model_f.get())
+            stock_lim = STOCK_FILTER_LIMITS.get(stock_f.get())
+            if stock_lim is not None:
+                sql += " AND COALESCE(i.qty,0)<=?"
+                params.append(stock_lim)
             sql += " ORDER BY i.item_no LIMIT 300"
             with connect() as c:
                 rows = c.execute(sql, params).fetchall()
@@ -6397,16 +6612,21 @@ class App(tk.Tk):
             redraw()
 
         def add_shortage():
-            if not rep_cb.get():
-                messagebox.showwarning("تنبيه", "اختر المورد أولًا")
-                return
             q = read_qty()
             if not q:
                 return
+            lim = STOCK_FILTER_LIMITS.get(stock_f.get(), 2)
             with connect() as c:
-                rows = c.execute("SELECT * FROM items WHERE (supplier=? OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=items.id AND p.supplier=?)) AND COALESCE(qty,0)<=0 ORDER BY item_no", (rep_cb.get(), rep_cb.get())).fetchall()
+                if can_see_sup:
+                    if not rep_cb.get():
+                        messagebox.showwarning("تنبيه", "اختر المورد أولًا")
+                        return
+                    rows = c.execute("SELECT * FROM items WHERE (supplier=? OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=items.id AND p.supplier=?)) AND COALESCE(qty,0)<=? ORDER BY item_no",
+                                     (rep_cb.get(), rep_cb.get(), lim)).fetchall()
+                else:
+                    rows = c.execute("SELECT * FROM items WHERE COALESCE(qty,0)<=? ORDER BY item_no", (lim,)).fetchall()
             if not rows:
-                messagebox.showinfo("تنبيه", "لا توجد أصناف نافدة لهذا المورد")
+                messagebox.showinfo("تنبيه", "لا توجد أصناف بهذه الكمية أو أقل")
                 return
             for r in rows:
                 add_line(r, q)
@@ -6442,8 +6662,8 @@ class App(tk.Tk):
             load_items()
 
         def issue():
-            rp = rep_cb.get()
-            if not rp:
+            rp = rep_cb.get() if can_see_sup else "بدون مورد محدد (يختاره المدير)"
+            if can_see_sup and not rp:
                 messagebox.showwarning("تنبيه", "اختر المورد أولًا")
                 return
             if not lines:
@@ -6511,9 +6731,20 @@ class App(tk.Tk):
         cat_f.bind("<<ComboboxSelected>>", load_items)
         make_f.bind("<<ComboboxSelected>>", on_make)
         model_f.bind("<<ComboboxSelected>>", load_items)
+        def po_preview(_e=None):
+            sel = av.selection()
+            if not sel:
+                po_set_preview("", None)
+                return
+            with connect() as c:
+                r = c.execute("SELECT image FROM items WHERE id=?", (int(sel[0]),)).fetchone()
+            po_set_preview((r["image"] if r else ""), int(sel[0]))
+
         av.bind("<Double-1>", add_prompt)
+        av.bind("<<TreeviewSelect>>", po_preview)
         if show_cost:
-            av.bind("<<TreeviewSelect>>", show_sel_info)
+            av.bind("<<TreeviewSelect>>", show_sel_info, add="+")
+        stock_f.bind("<<ComboboxSelected>>", load_items)
         rep_cb.bind("<<ComboboxSelected>>", on_rep)
         flt.bind("<KeyRelease>", load_items)
         lt.bind("<Double-1>", edit_qty)
@@ -6537,7 +6768,7 @@ class App(tk.Tk):
                 """, (own, own)).fetchall()
             clear_tree(t2)
             for r in rows:
-                add_row(t2, (r["po_no"], str(r["created_at"])[:16], r["rep_name"], r["created_by"], r["n"], r["q"], st_ar.get(r["status"], r["status"])),
+                add_row(t2, (r["po_no"], str(r["created_at"])[:16], (r["rep_name"] or "—") if can_see_sup else "—", r["created_by"], r["n"], r["q"], st_ar.get(r["status"], r["status"])),
                         iid=str(r["id"]), extra=("low",) if r["status"] == "pending" else ())
             self.refresh_badges()
 
@@ -6596,6 +6827,8 @@ class App(tk.Tk):
             ttk.Button(bar2, text="📤 إعادة إرسال لجوال المدير", command=resend_manager).pack(side="right", padx=4)
         t2.bind("<Double-1>", lambda e: details())
         load2()
+        if not can_see_sup:
+            load_items()
 
     def po_details(self, po_id):
         with connect() as c:
@@ -7615,6 +7848,8 @@ class App(tk.Tk):
                                      COUNT(DISTINCT s.invoice) n, COALESCE(SUM(s.price*s.qty),0) total,
                                      COALESCE(SUM(s.paid),0) paid
                                      FROM sales s WHERE {where} GROUP BY ptype ORDER BY total DESC""", params).fetchall()
+                card_paid = num(c.execute(f"""SELECT COALESCE(SUM(s.paid),0) FROM sales s
+                                              WHERE {where} AND s.payment_type='بطاقة'""", params).fetchone()[0])
                 sellers = c.execute(f"""SELECT COALESCE(NULLIF(s.seller,''),'غير مسجل') seller,
                                      COUNT(DISTINCT s.invoice) invoices, COALESCE(SUM(s.qty),0) pieces,
                                      COALESCE(SUM(s.price*s.qty),0) total, COALESCE(SUM(s.paid),0) paid
@@ -7632,7 +7867,7 @@ class App(tk.Tk):
                 debts_now = total_customer_debt(c)
             label = "كل الفترات" if not (d1 or d2) else f"من {d1 or 'البداية'} إلى {d2 or 'اليوم'}"
             range_lbl.configure(text=f"الفترة: {label}")
-            cash_net = tot["net_collected"] + tot["debt_collected"] - tot["expenses"]
+            cash_net = tot["net_collected"] + tot["debt_collected"] - tot["expenses"] - card_paid
             self.card_grid([
                 ("صافي المبيعات", sar(tot["net_sales"]), GREEN),
                 ("إجمالي المبيعات قبل المرتجع", sar(tot["gross"]), ACCENT),
@@ -7708,6 +7943,11 @@ class App(tk.Tk):
                                      COUNT(DISTINCT s.invoice) n, COALESCE(SUM(s.price*s.qty),0) total,
                                      COALESCE(SUM(s.paid),0) paid
                                      FROM sales s WHERE {where} GROUP BY ptype ORDER BY total DESC""", params).fetchall()
+                cash_paid = num(c.execute(f"""SELECT COALESCE(SUM(s.paid),0) FROM sales s
+                                              WHERE {where} AND COALESCE(NULLIF(s.payment_type,''),'كاش')='كاش'""",
+                                          params).fetchone()[0])
+                card_paid = num(c.execute(f"""SELECT COALESCE(SUM(s.paid),0) FROM sales s
+                                              WHERE {where} AND s.payment_type='بطاقة'""", params).fetchone()[0])
                 cash_returns = num(c.execute("""SELECT COALESCE(SUM(amount),0) FROM sale_returns
                                                 WHERE substr(ts,1,10)=? AND refund_type='نقدي'""", (day,)).fetchone()[0])
                 late_void = num(c.execute("""SELECT COALESCE(SUM(paid),0) FROM sales
@@ -7718,7 +7958,7 @@ class App(tk.Tk):
                 open_debts = num(c.execute("""SELECT COALESCE(SUM(price*qty-paid),0) FROM sales
                                               WHERE COALESCE(voided,0)=0 AND substr(date,1,10)=? AND price*qty>paid""",
                                            (day,)).fetchone()[0])
-            expected = tot["paid"] + tot["debt_collected"] - cash_returns - late_void - tot["expenses"]
+            expected = cash_paid + tot["debt_collected"] - cash_returns - late_void - tot["expenses"]
             lines = [
                 "تقرير إغلاق اليومية (Z)",
                 "التاريخ: " + day,
@@ -7732,6 +7972,7 @@ class App(tk.Tk):
                 "",
                 "التحصيل والصندوق",
                 f"  المدفوع عند البيع: {sar(tot['paid'])}",
+                f"  منها بالبطاقة (خارج الصندوق): {sar(card_paid)}",
                 f"  تحصيل ديون لاحقة: {sar(tot['debt_collected'])}",
                 f"  مرتجع نقدي للعملاء: {sar(cash_returns)}",
                 f"  مدفوع فواتير ملغاة سابقة: {sar(late_void)}",
