@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.1"
+APP_VERSION = "16.7.2"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1067,7 +1067,40 @@ def item_display_name(r):
     return name or (r["part"] or "")
 
 
-# ------------------------------------------------------------------ تنبيهات النواقص
+# ------------------------------------------------------------------ بادئات أرقام الريموت
+# بادئات موثّقة لأرقام القطع الأصلية (OEM) لكل شركة — تعمل تلقائيًا في كشف رقم الريموت
+SEED_REMOTE_PREFIXES = {
+    "تويوتا": ("89904",),                 # 89904-xxxxx
+    "هيونداي": ("95440", "95430"),        # 95440 للمفاتيح الذكية، و95430 لبعض الريموتات الأخرى
+    "كيا": ("95440", "95430"),            # 95440 للمفاتيح الذكية، و95430 لبعض الريموتات
+    "شيفروليه": ("135",),                 # 135 يظهر في بعض أرقام قطع GM وليس بداية موحّدة لكل الريموتات
+    "جي ام سي": ("135",),
+}
+
+# أسماء الشركات كما تُكتب في البرنامج أو كما يكتبها المورد
+REMOTE_PREFIX_MAKE_ALIASES = {
+    "toyota": "تويوتا", "تويوتا": "تويوتا",
+    "hyundai": "هيونداي", "هيونداي": "هيونداي", "هونداي": "هيونداي",
+    "kia": "كيا", "كيا": "كيا",
+    "chevrolet": "شيفروليه", "chevy": "شيفروليه", "شفروليه": "شيفروليه", "شيفروليه": "شيفروليه",
+    "gm": "شيفروليه", "general motors": "شيفروليه",
+    "gmc": "جي ام سي", "جي ام سي": "جي ام سي",
+}
+
+
+def _make_key(v):
+    """توحيد كتابة اسم الشركة للمقارنة (همزات / تاء مربوطة / ألف مقصورة / مسافات / حالة الأحرف)."""
+    v = clean_name(v).lower().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ة", "ه").replace("ى", "ي")
+    v = "".join(ch if (ch.isalnum() or ch == " ") else " " for ch in v)
+    return " ".join(v.split())
+
+
+def seed_remote_prefixes(make=""):
+    """البادئات الموثّقة لأرقام قطع الشركة (تويوتا 89904، هيونداي وكيا 95440 و95430، شفروليه وجي إم سي 135)."""
+    key = REMOTE_PREFIX_MAKE_ALIASES.get(_make_key(make))
+    return list(SEED_REMOTE_PREFIXES.get(key, ())) if key else []
+
+
 def remote_prefixes(c, make="", model=""):
     """بادئات أرقام الريموت: ما يحدده المدير في الإعدادات + بداية أرقام ريموتات نفس السيارة المسجلة."""
     out = []
@@ -1077,6 +1110,10 @@ def remote_prefixes(c, make="", model=""):
             out.append(p)
     rows = []
     make, model = clean_name(make), clean_name(model)
+    # بادئات الشركة الموثّقة تعمل حتى قبل تسجيل أي ريموت لنفس السيارة
+    for p in seed_remote_prefixes(make):
+        if p not in out:
+            out.append(p)
     if make:
         if model:
             rows = c.execute("""SELECT COALESCE(NULLIF(remote_no,''), part) v FROM items
@@ -1608,8 +1645,9 @@ _NUM_RE = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
 _DATE_RE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
 
 
-def read_pdf_words(path):
-    """يقرأ كلمات الـ PDF مع إحداثياتها (صفحة بصفحة). يحتاج مكتبة pdfplumber (أو PyMuPDF)."""
+def read_pdf_words(path, stats=None):
+    """يقرأ كلمات الـ PDF مع إحداثياتها (صفحة بصفحة). يحتاج مكتبة pdfplumber (أو PyMuPDF).
+    ويجمع في stats معلومات تشخيصية (عدد الصفحات/الكلمات/الصور) تُستخدم لشرح سبب تعذّر قراءة الملف."""
     try:
         import pdfplumber
     except ImportError:
@@ -1619,6 +1657,13 @@ def read_pdf_words(path):
         with pdfplumber.open(path) as pdf:
             for p in pdf.pages:
                 ws = p.extract_words(x_tolerance=2, y_tolerance=2)
+                if stats is not None:
+                    stats["pages"] = stats.get("pages", 0) + 1
+                    stats.setdefault("words", []).append(len(ws))
+                    try:
+                        stats.setdefault("images", []).append(len(p.images))
+                    except Exception:
+                        stats.setdefault("images", []).append(0)
                 pages.append([{"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"], "bottom": w["bottom"]} for w in ws])
         return pages
     try:
@@ -1639,7 +1684,11 @@ def read_pdf_words(path):
     pages = []
     doc = fitz.open(path)
     for p in doc:
-        pages.append([{"text": w[4], "x0": w[0], "x1": w[2], "top": w[1], "bottom": w[3]} for w in p.get_text("words")])
+        ws = p.get_text("words")
+        if stats is not None:
+            stats["pages"] = stats.get("pages", 0) + 1
+            stats.setdefault("words", []).append(len(ws))
+        pages.append([{"text": w[4], "x0": w[0], "x1": w[2], "top": w[1], "bottom": w[3]} for w in ws])
     return pages
 
 
@@ -1685,27 +1734,46 @@ def _to_iso_date(text):
         return ""
 
 
+# ---- أسماء أعمدة جداول فواتير الموردين: إنجليزي + عربي (بعض الموردين يطبع العناوين بالعربي)
+HDR_QTY = ("quantity", "qty", "qty.", "الكمية", "كمية", "العدد", "عدد")
+HDR_PRICE = ("price", "unit price", "unitprice", "cost", "السعر", "سعر الوحدة", "سعر")
+HDR_TOTAL = ("total", "amount", "line total", "الإجمالي", "الاجمالي", "إجمالي", "اجمالي", "المجموع")
+HDR_UNIT = ("unit", "الوحدة")
+HDR_ROW = ("#", "no", "no.", "no:", "no#", "sn", "s/n", "الرقم", "رقم", "م")
+HDR_CODE = ("code", "part", "partno", "part no", "part no.", "part#", "الكود", "كود", "رقم القطعة")
+HDR_IMAGE = ("image", "photo", "picture", "pic", "الصورة", "صورة", "صوره")
+HDR_ITEM = ("item", "items", "description", "desc", "detail", "الصنف", "الوصف", "البيان")
+
+
+def _hdr_word(words, names, pred=None):
+    """أول كلمة تطابق أحد أسماء أعمدة الجدول (مع شرط إضافي اختياري لموضع العمود)."""
+    for w in words:
+        if w["text"].lower().strip() in names and (pred is None or pred(w)):
+            return w
+    return None
+
+
 def _find_table_columns(words):
-    """يحدد أعمدة الجدول من صف العناوين (الكمية / السعر / الإجمالي ...)."""
-    qty = next((w for w in words if w["text"].lower() in ("quantity", "qty", "qty.")), None)
+    """يحدد أعمدة الجدول من صف العناوين (الكمية / السعر / الإجمالي ...) — عربي أو إنجليزي."""
+    qty = _hdr_word(words, HDR_QTY)
     if not qty:
         return None
     ht = qty["top"]
     near = sorted([w for w in words if abs(w["top"] - ht) < 14], key=lambda w: w["x0"])
-    price = next((w for w in near if w["text"].lower() == "price" and w["x0"] > qty["x1"]), None)
+    price = _hdr_word(near, HDR_PRICE, lambda w: w["x0"] > qty["x1"])
     if not price:
         return None
-    total = next((w for w in near if w["text"].lower() in ("total", "amount") and w["x0"] > price["x0"]), None)
+    total = _hdr_word(near, HDR_TOTAL, lambda w: w["x0"] > price["x0"])
     price_c = _cx(price)
-    unit = next((w for w in near if w["text"].lower() == "unit" and abs(w["x1"] - price["x0"]) < 12), None)
+    unit = _hdr_word(near, HDR_UNIT, lambda w: abs(w["x1"] - price["x0"]) < 12)
     if unit:
         price_c = (unit["x0"] + price["x1"]) / 2.0
-    hash_w = next((w for w in near if w["text"].lower() in ("#", "no#", "no", "no.") and w["x0"] < qty["x0"]), None)
+    hash_w = _hdr_word(near, HDR_ROW, lambda w: w["x0"] < qty["x0"])
     if not hash_w:
         return None
-    code_w = next((w for w in near if w["text"].lower() == "code"), None)
-    image_w = next((w for w in near if w["text"].lower() == "image"), None)
-    items = [w for w in near if w["text"].lower() == "item"]
+    code_w = _hdr_word(near, HDR_CODE)
+    image_w = _hdr_word(near, HDR_IMAGE)
+    items = [w for w in near if w["text"].lower().strip() in HDR_ITEM]
     col = {"header_top": ht, "qty_c": _cx(qty), "qty_x0": qty["x0"], "price_c": price_c,
            "total_c": _cx(total) if total else price_c + 45, "hash_c": _cx(hash_w), "hash_x1": hash_w["x1"]}
     if code_w:
@@ -1721,13 +1789,35 @@ def _find_table_columns(words):
     return col
 
 
-def parse_supplier_invoice(pages):
+def _no_table_reason(pages, stats, all_text):
+    """سبب عدم العثور على جدول الأصناف + معلومات تشخيصية عن الملف."""
+    bits = []
+    if stats:
+        bits.append(f"الصفحات: {stats.get('pages', len(pages))}")
+        bits.append(f"الكلمات المقروءة: {sum(stats.get('words') or [])}")
+        bits.append(f"الصور داخل الملف: {sum(stats.get('images') or [])}")
+    txt = re.sub(r"\s+", " ", all_text or "").strip()
+    return ("ما قدرت أتعرف على جدول الأصناف في هذا الملف"
+            + (" (" + "، ".join(bits) + ")" if bits else "")
+            + (f". أول نص في الملف: {txt[:200]}" if txt else ""))
+
+
+def parse_supplier_invoice(pages, stats=None):
     """يحوّل كلمات الـ PDF إلى فاتورة: رقم + تاريخ + عملة + أسطر (كود، وصف، كمية، سعر) + شحن/خصم/ضريبة."""
     res = {"invoice_no": "", "date": "", "currency": "", "supplier_guess": "", "lines": [],
            "shipping": 0.0, "discount": 0.0, "tax": 0.0, "net_pdf": None, "warnings": []}
     all_text = " ".join(w["text"] for pg in pages for w in pg)
     if not all_text.strip():
-        raise RuntimeError("لا يوجد نص داخل الملف (ربما هو صورة ممسوحة). الملف لازم يكون PDF فيه نص قابل للتحديد.")
+        n_pages = (stats or {}).get("pages") or len(pages)
+        images = sum((stats or {}).get("images") or [])
+        raise RuntimeError(
+            "لا يوجد أي نص داخل ملف الفاتورة — الملف صور (سكانر أو لقطات شاشة) بدون نص قابل للتحديد.\n\n"
+            f"عدد الصفحات: {n_pages}، عدد الصور داخل الملف: {images}\n\n"
+            "البرنامج يقرأ النص فقط ولا يقرأ الأصناف من الصور (بدون OCR)، "
+            "لذلك ما يقدر يستخرج أسماء الأصناف والكميات من هذا الملف.\n"
+            "الحل: اطلب من المورد نسخة PDF أصلية فيها نص قابل للتحديد، "
+            "أو أدخل الأصناف يدويًا من صفحة (المشتريات)."
+        )
     if re.search(r"\bAED\b|dirham|د\.إ|إ\.د|درهم", all_text, re.I):
         res["currency"] = "AED"
     elif re.search(r"\bSAR\b|riyal|ريال", all_text, re.I):
@@ -1858,7 +1948,9 @@ def parse_supplier_invoice(pages):
             elif "tax" in toks or "vat" in toks:
                 res["tax"] = val
     if not res["lines"]:
-        res["warnings"].append("ما قدرت أتعرف على جدول الأصناف في هذا الملف.")
+        res["warnings"].append(_no_table_reason(pages, stats, all_text))
+    elif stats and any(not n for n in (stats.get("words") or [])):
+        res["warnings"].append("فيه صفحة في الملف بدون أي نص قابل للتحديد — غالبًا صورة ممسوحة، راجع أصنافها يدويًا.")
     return res
 
 
@@ -6303,7 +6395,9 @@ class App(tk.Tk):
             setsetting("remote_prefixes", d["prefixes"].strip())
 
         self.form("بادئات أرقام الريموت", [
-            ("prefixes", "البادئات مفصولة بفاصلة — مثال: 89070, RM-, KEY", setting("remote_prefixes")),
+            ("prefixes", "البادئات مفصولة بفاصلة — مثال: 89070, RM-, KEY | والبرنامج يعرف مسبقًا: "
+                         "تويوتا 89904، هيونداي وكيا 95440 و 95430، شفروليه وجي إم سي 135",
+             setting("remote_prefixes")),
         ], save, on_done=on_done)
 
     def backup_full(self):
@@ -7017,8 +7111,9 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- صور الأصناف من فاتورة (حتى لو سُجّلت سابقًا)
     def _read_invoice_pdf(self, path):
+        stats = {}
         try:
-            return parse_supplier_invoice(read_pdf_words(path))
+            return parse_supplier_invoice(read_pdf_words(path, stats), stats)
         except Exception as e:
             messagebox.showerror("تعذّرت قراءة الملف", str(e))
             return None
@@ -7164,10 +7259,8 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(parent=self, title="اختر فاتورة المورد (PDF)", filetypes=[("PDF", "*.pdf"), ("كل الملفات", "*.*")])
         if not path:
             return
-        try:
-            parsed = parse_supplier_invoice(read_pdf_words(path))
-        except Exception as e:
-            messagebox.showerror("تعذّرت قراءة الملف", str(e))
+        parsed = self._read_invoice_pdf(path)
+        if not parsed:
             return
         if not parsed["lines"]:
             messagebox.showwarning("تنبيه", "\n".join(parsed["warnings"]) or "لم أجد أصنافًا في الملف")
