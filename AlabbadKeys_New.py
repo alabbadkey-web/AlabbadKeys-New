@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.3"
+APP_VERSION = "16.7.5"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1735,9 +1735,9 @@ def _to_iso_date(text):
 
 
 # ---- أسماء أعمدة جداول فواتير الموردين: إنجليزي + عربي (بعض الموردين يطبع العناوين بالعربي)
-HDR_QTY = ("quantity", "qty", "qty.", "الكمية", "كمية", "العدد", "عدد")
-HDR_PRICE = ("price", "unit price", "unitprice", "cost", "السعر", "سعر الوحدة", "سعر")
-HDR_TOTAL = ("total", "amount", "line total", "الإجمالي", "الاجمالي", "إجمالي", "اجمالي", "المجموع")
+HDR_QTY = ("quantity", "qty", "qty.", "qty(pcs)", "quant", "quant.", "pcs", "الكمية", "الكميه", "كمية", "العدد", "عدد")
+HDR_PRICE = ("price", "unit price", "unitprice", "unit_price", "u/price", "rate", "cost", "السعر", "سعر الوحدة", "سعر")
+HDR_TOTAL = ("total", "amount", "line total", "value", "net amount", "الإجمالي", "الاجمالي", "إجمالي", "اجمالي", "المجموع")
 HDR_UNIT = ("unit", "الوحدة")
 HDR_ROW = ("#", "no", "no.", "no:", "no#", "sn", "s/n", "الرقم", "رقم", "م")
 HDR_CODE = ("code", "part", "partno", "part no", "part no.", "part#", "الكود", "كود", "رقم القطعة")
@@ -1753,29 +1753,34 @@ def _hdr_word(words, names, pred=None):
     return None
 
 
-def _find_table_columns(words):
-    """يحدد أعمدة الجدول من صف العناوين (الكمية / السعر / الإجمالي ...) — عربي أو إنجليزي."""
+def _find_table_columns(words, debug=None):
+    """يحدد أعمدة الجدول من صف العناوين (الكمية / السعر / الإجمالي ...) — عربي أو إنجليزي.
+    عمود الترقيم (#) اختياري: كثير من الفواتير ما فيه عمود رقم سطر."""
+    def why(msg):
+        if debug is not None:
+            debug.append(msg)
+        return None
+
     qty = _hdr_word(words, HDR_QTY)
     if not qty:
-        return None
+        return why("ما فيه عمود كمية (QTY) في الملف")
     ht = qty["top"]
     near = sorted([w for w in words if abs(w["top"] - ht) < 14], key=lambda w: w["x0"])
     price = _hdr_word(near, HDR_PRICE, lambda w: w["x0"] > qty["x1"])
     if not price:
-        return None
+        return why(f"لقيت عمود الكمية «{qty['text']}» لكن ما فيه عمود سعر على يمينه بنفس السطر")
     total = _hdr_word(near, HDR_TOTAL, lambda w: w["x0"] > price["x0"])
     price_c = _cx(price)
     unit = _hdr_word(near, HDR_UNIT, lambda w: abs(w["x1"] - price["x0"]) < 12)
     if unit:
         price_c = (unit["x0"] + price["x1"]) / 2.0
     hash_w = _hdr_word(near, HDR_ROW, lambda w: w["x0"] < qty["x0"])
-    if not hash_w:
-        return None
     code_w = _hdr_word(near, HDR_CODE)
     image_w = _hdr_word(near, HDR_IMAGE)
     items = [w for w in near if w["text"].lower().strip() in HDR_ITEM]
     col = {"header_top": ht, "qty_c": _cx(qty), "qty_x0": qty["x0"], "price_c": price_c,
-           "total_c": _cx(total) if total else price_c + 45, "hash_c": _cx(hash_w), "hash_x1": hash_w["x1"]}
+           "total_c": _cx(total) if total else price_c + 45,
+           "hash_c": _cx(hash_w) if hash_w else None, "hash_x1": hash_w["x1"] if hash_w else None}
     if code_w:
         item_w = next((w for w in items if w["x0"] > code_w["x1"]), None)
         first_item = next((w for w in items if w["x1"] <= code_w["x0"] + 2), None)
@@ -1785,11 +1790,16 @@ def _find_table_columns(words):
             col["has_code_col"] = True
     if not col.get("has_code_col"):
         col["has_code_col"] = False
-        col["desc_lo"] = (image_w["x1"] if image_w else hash_w["x1"]) + 10
+        if image_w:
+            col["desc_lo"] = image_w["x1"] + 10
+        elif hash_w:
+            col["desc_lo"] = hash_w["x1"] + 10
+        else:
+            col["desc_lo"] = 0
     return col
 
 
-def _no_table_reason(pages, stats, all_text):
+def _no_table_reason(pages, stats, all_text, debug=None):
     """سبب عدم العثور على جدول الأصناف + معلومات تشخيصية عن الملف."""
     bits = []
     if stats:
@@ -1797,9 +1807,178 @@ def _no_table_reason(pages, stats, all_text):
         bits.append(f"الكلمات المقروءة: {sum(stats.get('words') or [])}")
         bits.append(f"الصور داخل الملف: {sum(stats.get('images') or [])}")
     txt = re.sub(r"\s+", " ", all_text or "").strip()
-    return ("ما قدرت أتعرف على جدول الأصناف في هذا الملف"
-            + (" (" + "، ".join(bits) + ")" if bits else "")
-            + (f". أول نص في الملف: {txt[:200]}" if txt else ""))
+    msg = ("ما قدرت أتعرف على جدول الأصناف في هذا الملف"
+           + (" (" + "، ".join(bits) + ")" if bits else "")
+           + (f". أول نص في الملف: {txt[:200]}" if txt else ""))
+    if debug:
+        msg += "\n\nالسبب: " + " | ".join(debug[-3:])
+    return msg
+
+
+# ------------------------------------------------------------------ قراءة الفواتير بالصور (OCR)
+OCR_DPI = 220
+
+_OCR_PS = r"""
+param([string]$Path, [string]$Out)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) {
+    $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))
+    $task.Wait(-1) | Out-Null
+    $task.Result
+}
+[Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null
+[Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
+$engine = $null
+try { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() } catch { }
+if (-not $engine) {
+    foreach ($tag in @('en-US', 'ar-SA')) {
+        try {
+            $lang = New-Object Windows.Globalization.Language $tag
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+            if ($engine) { break }
+        } catch { }
+    }
+}
+if (-not $engine) { throw 'Windows OCR not available on this machine' }
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+$list = New-Object System.Collections.ArrayList
+foreach ($line in $result.Lines) {
+    foreach ($w in $line.Words) {
+        $r = $w.BoundingRect
+        [void]$list.Add([pscustomobject]@{ t = $w.Text; x = [double]$r.X; y = [double]$r.Y; w = [double]$r.Width; h = [double]$r.Height })
+    }
+}
+$list | ConvertTo-Json -Compress | Out-File -FilePath $Out -Encoding utf8
+"""
+
+
+def render_pdf_pages(path, dpi=OCR_DPI):
+    """يحوّل صفحات PDF إلى صور PNG (OCR) — يستخدم pdfplumber/pypdfium2 ثم PyMuPDF كبديل."""
+    tmp_dir = tempfile.mkdtemp(prefix="alabbad_ocr_")
+    out = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                fp = os.path.join(tmp_dir, "page_%02d.png" % (i + 1))
+                page.to_image(resolution=dpi).original.save(fp)
+                out.append(fp)
+        if out:
+            return out
+    except Exception:
+        out = []
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
+    if fitz is not None:
+        doc = fitz.open(path)
+        for i, page in enumerate(doc):
+            fp = os.path.join(tmp_dir, "page_%02d.png" % (i + 1))
+            page.get_pixmap(dpi=dpi).save(fp)
+            out.append(fp)
+    if not out:
+        raise RuntimeError("تعذّر تحويل صفحات الفاتورة إلى صور لقراءتها بالـ OCR.")
+    return out
+
+
+def _ocr_words_tesseract(img_path, scale):
+    """OCR عبر Tesseract (يحتاج تثبيت برنامج Tesseract + مكتبة pytesseract). يرجع None إذا غير متاح."""
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    img = Image.open(img_path)
+    last = None
+    for lang in ("ara+eng", "eng"):
+        try:
+            data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT, config="--psm 6")
+        except Exception as e:
+            last = e
+            continue
+        words = []
+        for i, txt in enumerate(data.get("text") or []):
+            t = (txt or "").strip()
+            if not t:
+                continue
+            try:
+                if float(data["conf"][i]) < 30:
+                    continue
+            except Exception:
+                pass
+            x, y, wd, ht = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            words.append({"text": t, "x0": x * scale, "x1": (x + wd) * scale,
+                          "top": y * scale, "bottom": (y + ht) * scale})
+        if words:
+            return words
+    if last is not None:
+        raise RuntimeError(str(last))
+    return None
+
+
+def _ocr_words_windows(img_path, scale):
+    """OCR عبر محرّك Windows المدمج (Windows 10/11) بدون أي تثبيت إضافي."""
+    if os.name != "nt":
+        return None
+    tmp = tempfile.mkdtemp(prefix="alabbad_winocr_")
+    ps1 = os.path.join(tmp, "ocr.ps1")
+    out = os.path.join(tmp, "ocr.json")
+    with open(ps1, "w", encoding="utf-8-sig") as f:
+        f.write(_OCR_PS)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Path", img_path, "-Out", out],
+                          capture_output=True, text=True, creationflags=flags, timeout=180)
+    if not os.path.isfile(out):
+        msg = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(msg[:300] or "محرّك OCR في ويندوز لم يرجع نتيجة")
+    data = json.loads(open(out, encoding="utf-8-sig").read() or "[]")
+    if isinstance(data, dict):
+        data = [data]
+    words = []
+    for d in data:
+        t = str(d.get("t") or "").strip()
+        if not t:
+            continue
+        x, y = float(d.get("x", 0)), float(d.get("y", 0))
+        wd, ht = float(d.get("w", 0)), float(d.get("h", 0))
+        words.append({"text": t, "x0": x * scale, "x1": (x + wd) * scale,
+                      "top": y * scale, "bottom": (y + ht) * scale})
+    return words
+
+
+def ocr_image_words(img_path, scale):
+    """يرجع كلمات الصورة بإحداثيات بالنقاط (نفس مقياس PDF)."""
+    errs = []
+    for fn in (_ocr_words_tesseract, _ocr_words_windows):
+        try:
+            words = fn(img_path, scale)
+        except Exception as e:
+            errs.append(str(e))
+            continue
+        if words:
+            return words
+    raise RuntimeError(
+        "ما فيه محرّك OCR متاح على هذا الجهاز.\n\n"
+        "الحل الأول (بدون تثبيت): شغّل البرنامج على Windows 10/11 — يستخدم محرّك Windows المدمج.\n"
+        "الحل الثاني: ثبّت Tesseract OCR ثم المكتبة pytesseract.\n"
+        + (("\n\nتفاصيل: " + " | ".join(errs[-2:])) if errs else "")
+    )
+
+
+def read_pdf_ocr_words(path, dpi=OCR_DPI):
+    """يحوّل صفحات الفاتورة إلى صور ويقرأها بالـ OCR، ثم يرجّع الكلمات بنفس شكل قراءة PDF."""
+    imgs = render_pdf_pages(path, dpi)
+    scale = 72.0 / float(dpi)
+    return [ocr_image_words(fp, scale) for fp in imgs]
 
 
 def norm_invoice_no(v):
@@ -1867,8 +2046,9 @@ def parse_supplier_invoice(pages, stats=None):
         res["currency"] = "USD"
 
     last_page, last_row_cy = None, None
+    dbg = []
     for pi, words in enumerate(pages):
-        col = _find_table_columns(words)
+        col = _find_table_columns(words, dbg)
         if not col:
             continue
         hdr = col["header_top"]
@@ -1897,13 +2077,19 @@ def parse_supplier_invoice(pages, stats=None):
         # ---- أسطر الجدول
         zone_lo = col["qty_x0"] - 12
         body = [w for w in words if w["top"] > hdr + 10]
-        rows = sorted([w for w in body if re.fullmatch(r"\d{1,3}", w["text"]) and abs(_cx(w) - col["hash_c"]) <= 14 and _cx(w) < zone_lo],
-                      key=_cy)
+        rows = []
+        if col["hash_c"] is not None:
+            rows = sorted([w for w in body if re.fullmatch(r"\d{1,3}", w["text"])
+                           and abs(_cx(w) - col["hash_c"]) <= 14 and _cx(w) < zone_lo], key=_cy)
+        if not rows:
+            # بدون عمود ترقيم: أرقام الكمية نفسها هي بداية كل سطر
+            rows = sorted([w for w in body if _is_num(w["text"])
+                           and abs(_cx(w) - col["qty_c"]) <= 28], key=_cy)
         if not rows:
             continue
         centers = [_cy(w) for w in rows]
         if col["has_code_col"]:
-            code_words = [w for w in body if col["hash_x1"] + 6 <= _cx(w) and w["x1"] <= col["code_hi"] + 2]
+            code_words = [w for w in body if (col["hash_x1"] or 0) + 6 <= _cx(w) and w["x1"] <= col["code_hi"] + 2]
             desc_words = [w for w in body if w["x1"] > col["code_hi"] + 2 and _cx(w) < zone_lo]
         else:
             code_words = []
@@ -1928,7 +2114,7 @@ def parse_supplier_invoice(pages, stats=None):
             if i == len(centers) - 1 and totals_top is not None:
                 hi = min(hi, totals_top - 1)
             bounds.append((lo, hi))
-        for (lo, hi), rw in zip(bounds, rows):
+        for idx_row, ((lo, hi), rw) in enumerate(zip(bounds, rows), start=1):
             inrow = [w for w in body if lo <= _cy(w) < hi]
             nums = {"qty": [], "price": [], "total": []}
             for w in inrow:
@@ -1954,12 +2140,18 @@ def parse_supplier_invoice(pages, stats=None):
                 if dl and len(dl[0]["words"]) == 1 and re.search(r"\d", dl[0]["text"]):
                     code = dl[0]["text"]
                     dl = dl[1:]
+                elif dl and len(dl[0]["words"]) > 1:
+                    ft = dl[0]["words"][0]["text"]
+                    if re.search(r"\d", ft) and (re.search(r"[-/]", ft) or len(ft) >= 6):
+                        code = ft
+                        rest = " ".join(x["text"] for x in dl[0]["words"][1:]).strip()
+                        dl = ([{"cy": dl[0]["cy"], "text": rest, "words": dl[0]["words"][1:]}] if rest else []) + dl[1:]
                 dlines = [ln["text"] for ln in dl]
             desc = " ".join(dlines)
             if code and desc.upper().startswith(code.upper()):
                 desc = desc[len(code):].lstrip("- ")
             desc = re.sub(r"\s+", " ", desc).strip().rstrip("-").strip()
-            n = int(rw["text"])
+            n = idx_row
             if qty is None or price is None or qty <= 0:
                 res["warnings"].append(f"السطر {n}: تعذّرت قراءة الكمية أو السعر — أضفه يدويًا")
                 continue
@@ -1989,7 +2181,7 @@ def parse_supplier_invoice(pages, stats=None):
             elif "tax" in toks or "vat" in toks:
                 res["tax"] = val
     if not res["lines"]:
-        res["warnings"].append(_no_table_reason(pages, stats, all_text))
+        res["warnings"].append(_no_table_reason(pages, stats, all_text, dbg))
     elif stats and any(not n for n in (stats.get("words") or [])):
         res["warnings"].append("فيه صفحة في الملف بدون أي نص قابل للتحديد — غالبًا صورة ممسوحة، راجع أصنافها يدويًا.")
     return res
@@ -7184,13 +7376,55 @@ class App(tk.Tk):
         return n
 
     # ------------------------------------------------------------- صور الأصناف من فاتورة (حتى لو سُجّلت سابقًا)
-    def _read_invoice_pdf(self, path):
+    def _read_invoice_pdf(self, path, use_ocr=None):
+        """يقرأ الفاتورة من نص الـ PDF، وإذا فشل الجدول يجرّب التعرف الضوئي (OCR) على صور الصفحات."""
         stats = {}
+        parsed = None
+        err = ""
         try:
-            return parse_supplier_invoice(read_pdf_words(path, stats), stats)
+            parsed = parse_supplier_invoice(read_pdf_words(path, stats), stats)
         except Exception as e:
-            messagebox.showerror("تعذّرت قراءة الملف", str(e))
-            return None
+            err = str(e)
+        if parsed and parsed.get("lines"):
+            return parsed
+        reason = err or "\n".join(parsed.get("warnings") or []) or "ما وجدت أصنافًا في نص الملف."
+        if use_ocr is None:
+            use_ocr = messagebox.askyesno(
+                "قراءة الفاتورة بالصور (OCR)",
+                "ما قدرت أستخرج جدول الأصناف من نص الملف:\n\n" + reason[:600] +
+                "\n\nأجرّب قراءتها بالتعرف الضوئي على الحروف (OCR) من صور الصفحات؟\n"
+                "OCR قد يخطئ في بعض الأرقام، وستظهر النتائج للمراجعة قبل الحفظ.")
+        if not use_ocr:
+            if parsed is None:
+                messagebox.showerror("تعذّرت قراءة الملف", reason)
+            return parsed
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            pages = read_pdf_ocr_words(path)
+        except Exception as e:
+            self.config(cursor="")
+            messagebox.showerror("تعذّر تشغيل OCR", str(e))
+            return parsed
+        finally:
+            try:
+                self.config(cursor="")
+            except Exception:
+                pass
+        ocr = parse_supplier_invoice(pages)
+        if ocr.get("lines"):
+            if not ocr.get("invoice_no") and parsed:
+                ocr["invoice_no"] = parsed.get("invoice_no", "")
+            if not ocr.get("date") and parsed:
+                ocr["date"] = parsed.get("date", "")
+            ocr["warnings"].append("قُرئت هذه الفاتورة بالتعرف الضوئي (OCR): راجع الأسعار والكميات قبل الحفظ.")
+            return ocr
+        messagebox.showwarning(
+            "OCR",
+            "قرأت الصور لكن ما قدرت أستخرج جدول الأصناف منها أيضًا.\n\n"
+            + "\n".join((ocr.get("warnings") or [])[:2])
+            + "\n\nجرّب صورة أوضح للفاتورة، أو أدخل الأصناف يدويًا.")
+        return parsed
 
     def _image_plan(self, c, supplier, lines, imgs, replace):
         """يطابق أسطر الفاتورة مع الأصناف الموجودة (برمز المورد) ويحدد أين تُضاف الصورة."""
