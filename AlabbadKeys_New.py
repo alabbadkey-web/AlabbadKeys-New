@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.2"
+APP_VERSION = "16.7.3"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1802,6 +1802,47 @@ def _no_table_reason(pages, stats, all_text):
             + (f". أول نص في الملف: {txt[:200]}" if txt else ""))
 
 
+def norm_invoice_no(v):
+    """رقم الفاتورة للمقارنة: بلا مسافات أو رموز، والحروف كبيرة."""
+    return re.sub(r"[^0-9A-Za-z\u0600-\u06FF]", "", str(v or "")).upper()
+
+
+def past_invoices(c, inv, supplier=""):
+    """فواتير المشتريات المسجّلة سابقًا بنفس الرقم (أي مورد) للتحذير من الرفع المكرر."""
+    key = norm_invoice_no(inv)
+    if not key:
+        return []
+    out = []
+    rows = c.execute("""SELECT batch, MIN(date) date, GROUP_CONCAT(DISTINCT supplier) sups, COUNT(*) lines,
+                               MAX(COALESCE(status,'')) statuses
+                        FROM purchases WHERE COALESCE(batch,'')<>'' GROUP BY batch""").fetchall()
+    for r in rows:
+        if norm_invoice_no(r["batch"]) != key:
+            continue
+        sups = [s for s in str(r["sups"] or "").split(",") if s.strip()]
+        out.append({"batch": r["batch"], "date": str(r["date"] or "")[:10], "suppliers": sups,
+                    "lines": r["lines"], "statuses": str(r["statuses"] or ""),
+                    "same_supplier": bool(supplier) and supplier in sups})
+    return out
+
+
+def find_items(c, term="", category="", make="", state="", limit=300):
+    """بحث الأصناف مع فلاتر النوع والسيارة والحالة — يُستخدم في نافذة اختيار الصنف والمنتجات المركّبة."""
+    ALL = "الكل"
+    t = "%" + str(term or "").strip() + "%"
+    sql = ("SELECT * FROM items WHERE (item_no LIKE ? OR part LIKE ? OR car LIKE ? OR COALESCE(rep_code,'') LIKE ?)"
+           " AND (?=? OR COALESCE(category,'') LIKE ? OR COALESCE(kind,'') LIKE ?)"
+           " AND (?=? OR car LIKE ? OR COALESCE(make,'') LIKE ? OR COALESCE(model,'') LIKE ?)")
+    args = [t, t, t, t, category, ALL, "%" + str(category) + "%", "%" + str(category) + "%",
+            make, ALL, "%" + str(make) + "%", "%" + str(make) + "%", "%" + str(make) + "%"]
+    if state and state != ALL:
+        sql += " AND (CASE WHEN UPPER(COALESCE(condition,'NEW'))='USED' THEN 'مستعمل' ELSE 'جديد' END)=?"
+        args.append(state)
+    sql += " ORDER BY item_no LIMIT ?"
+    args.append(int(limit))
+    return c.execute(sql, args).fetchall()
+
+
 def parse_supplier_invoice(pages, stats=None):
     """يحوّل كلمات الـ PDF إلى فاتورة: رقم + تاريخ + عملة + أسطر (كود، وصف، كمية، سعر) + شحن/خصم/ضريبة."""
     res = {"invoice_no": "", "date": "", "currency": "", "supplier_guess": "", "lines": [],
@@ -3538,33 +3579,63 @@ class App(tk.Tk):
         return result["v"]
 
     def pick_item(self, parent, title="اختر الصنف", initial=""):
-        """نافذة بحث لاختيار صنف موجود؛ ترجع رقم الصنف أو None."""
+        """بحث وفلترة (نوع القطعة / السيارة / جديد-مستعمل) لاختيار صنف موجود؛ ترجع رقم الصنف أو None."""
         result = {"id": None}
         dlg = tk.Toplevel(parent)
         dlg.title(title)
         dlg.configure(bg=BG)
         dlg.transient(parent)
         dlg.grab_set()
-        self.center(dlg, 820, 540)
+        self.center(dlg, 980, 620)
         fr = ttk.Frame(dlg, padding=12)
         fr.pack(fill="both", expand=True)
         top = ttk.Frame(fr)
         top.pack(fill="x")
         ttk.Label(top, text="بحث (رقم الصنف / القطعة / السيارة / رمز المورد)").pack(side="right", padx=4)
-        q = ttk.Entry(top, width=30, justify="right")
+        q = ttk.Entry(top, width=28, justify="right")
         q.pack(side="right", padx=4)
         q.insert(0, initial)
-        t = make_tree(fr, ("item_no", "name", "part", "qty"), {"item_no": "رقم الصنف", "name": "الاسم", "part": "رقم القطعة", "qty": "المتوفر"},
-                      {"name": 360}, height=10)
+        ALL = "الكل"
+        with connect() as c:
+            cats = [r["category"] for r in c.execute(
+                "SELECT DISTINCT category FROM items WHERE COALESCE(category,'') NOT IN ('','غير محدد') ORDER BY category").fetchall()]
+            makes = [r["name"] for r in c.execute("SELECT name FROM car_makes ORDER BY name").fetchall()]
+        flt = ttk.Frame(fr)
+        flt.pack(fill="x", pady=(6, 2))
+        ttk.Label(flt, text="نوع القطعة").pack(side="right", padx=(14, 4))
+        ty_cb = ttk.Combobox(flt, values=[ALL] + cats, state="readonly", width=20)
+        ty_cb.set(ALL)
+        ty_cb.pack(side="right", padx=4)
+        ttk.Label(flt, text="السيارة").pack(side="right", padx=(14, 4))
+        mk_cb = ttk.Combobox(flt, values=[ALL] + makes, state="readonly", width=16)
+        mk_cb.set(ALL)
+        mk_cb.pack(side="right", padx=4)
+        ttk.Label(flt, text="الحالة").pack(side="right", padx=(14, 4))
+        st_cb = ttk.Combobox(flt, values=[ALL, "جديد", "مستعمل"], state="readonly", width=10)
+        st_cb.set(ALL)
+        st_cb.pack(side="right", padx=4)
+        count_var = tk.StringVar(value="")
+        ttk.Label(fr, textvariable=count_var, style="Muted.TLabel").pack(anchor="e")
+        t = make_tree(fr, ("item_no", "name", "type", "car", "qty"),
+                      {"item_no": "رقم الصنف", "name": "الاسم", "type": "نوع القطعة", "car": "السيارة / الموديل", "qty": "المتوفر"},
+                      {"name": 320, "type": 150, "car": 190, "qty": 80}, height=10)
 
         def load(*_):
-            term = "%" + q.get().strip() + "%"
             with connect() as c:
-                rows = c.execute("""SELECT * FROM items WHERE item_no LIKE ? OR part LIKE ? OR car LIKE ? OR COALESCE(rep_code,'') LIKE ?
-                                    ORDER BY item_no LIMIT 200""", (term, term, term, term)).fetchall()
+                rows = find_items(c, q.get(), ty_cb.get(), mk_cb.get(), st_cb.get())
             clear_tree(t)
             for r in rows:
-                add_row(t, (r["item_no"], item_display_name(r), r["part"], r["qty"] or 0), iid=str(r["id"]))
+                add_row(t, (r["item_no"], item_display_name(r), r["category"] or "", r["car"] or "", r["qty"] or 0), iid=str(r["id"]))
+            count_var.set(f"{len(rows)} صنف" + (" (أول 300 — ضيّق الفلاتر)" if len(rows) >= 300 else ""))
+
+        def clear_filters(*_):
+            ty_cb.set(ALL)
+            mk_cb.set(ALL)
+            st_cb.set(ALL)
+            q.delete(0, "end")
+            load()
+
+        ttk.Button(flt, text="مسح الفلاتر", command=clear_filters).pack(side="left", padx=4)
 
         def ok(*_):
             sel = t.selection()
@@ -3575,6 +3646,9 @@ class App(tk.Tk):
         ttk.Button(fr, text="اختيار", style="Accent.TButton", command=ok).pack(pady=8)
         t.bind("<Double-1>", ok)
         q.bind("<KeyRelease>", load)
+        q.bind("<Return>", ok)
+        for cb in (ty_cb, mk_cb, st_cb):
+            cb.bind("<<ComboboxSelected>>", load)
         load()
         dlg.wait_window()
         return result["id"]
@@ -7629,6 +7703,24 @@ class App(tk.Tk):
         img_mode.pack(side="right", padx=4)
         info_var = tk.StringVar(value="")
         ttk.Label(head, textvariable=info_var, style="Muted.TLabel").pack(anchor="e")
+        dup_var = tk.StringVar(value="")
+        ttk.Label(head, textvariable=dup_var, foreground=RED, font=(FONT, 10, "bold"), wraplength=1080,
+                  justify="right").pack(anchor="e")
+
+        def check_dup(*_):
+            """يحذّر إذا كان رقم الفاتورة مسجّلًا قبل (نفس المورد أو مورد آخر)."""
+            inv = inv_e.get().strip()
+            with connect() as c:
+                past = past_invoices(c, inv, sup_cb.get().strip())
+            if not past:
+                dup_var.set("")
+                return []
+            p = past[0]
+            who = " / ".join(p["suppliers"]) or "غير محدد"
+            dup_var.set(f"⚠ الفاتورة رقم {inv} مسجّلة سابقًا ({p['date']} — المورد: {who} — {p['lines']} سطر)"
+                        + (" — نفس المورد: لا تُسجّل مرتين." if p["same_supplier"]
+                           else " — مورد مختلف: تأكد أنها ليست نفس الفاتورة."))
+            return past
 
         acts = ttk.Frame(body)
         acts.pack(fill="x", pady=4)
@@ -7854,6 +7946,23 @@ class App(tk.Tk):
             if rate <= 0:
                 messagebox.showwarning("تنبيه", "اكتب سعر التحويل إلى الريال", parent=win)
                 return
+            past = check_dup()
+            blocked = next((p for p in past if p["same_supplier"]), None)
+            if blocked:
+                messagebox.showwarning(
+                    "فاتورة مسجّلة",
+                    f"الفاتورة رقم {inv} مسجّلة من قبل لنفس المورد ({blocked['date']}).\n"
+                    "لو تريد إكمالها أو تعديلها، افتحها من صفحة المشتريات بدل تسجيلها مرة ثانية.",
+                    parent=win)
+                return
+            if past:
+                p = past[0]
+                if not messagebox.askyesno(
+                        "تكرار رقم الفاتورة",
+                        f"الفاتورة رقم {inv} سبق رفعها ({p['date']} — المورد: {' / '.join(p['suppliers']) or 'غير محدد'} — {p['lines']} سطر).\n\n"
+                        "هل تريد تسجيلها مرة أخرى؟",
+                        parent=win):
+                    return
             active = [ln for ln in lines if not ln["skip"]]
             if not active:
                 messagebox.showwarning("تنبيه", "كل الأسطر متجاهلة", parent=win)
@@ -7900,7 +8009,9 @@ class App(tk.Tk):
 
         t.bind("<Double-1>", lambda e: create_sel() if (t.selection() and not lines[int(t.selection()[0])]["item_id"]) else link_sel())
         cur_cb.bind("<<ComboboxSelected>>", on_cur)
-        sup_cb.bind("<<ComboboxSelected>>", rematch)
+        sup_cb.bind("<<ComboboxSelected>>", lambda e: (rematch(), check_dup()))
+        inv_e.bind("<KeyRelease>", lambda e: check_dup())
+        inv_e.bind("<FocusOut>", lambda e: check_dup())
         for e_ in (ship_e, tax_e, disc_e, rate_e):
             e_.bind("<KeyRelease>", refresh)
 
@@ -7910,6 +8021,7 @@ class App(tk.Tk):
             sup_cb.set(pre)
         on_cur()
         rematch()
+        check_dup()
 
     def sync_inventory(self, show_message=True):
         url = setting("sheets_url").strip()
