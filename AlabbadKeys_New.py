@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.5"
+APP_VERSION = "16.7.6"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1816,10 +1816,12 @@ def _no_table_reason(pages, stats, all_text, debug=None):
 
 
 # ------------------------------------------------------------------ قراءة الفواتير بالصور (OCR)
-OCR_DPI = 220
+# 600 نقطة/بوصة: جداول الفواتير المطبوعة بخط صغير (مثل فواتير موردي المفاتيح)
+# لا تُقرأ أرقامها بشكل صحيح بدقة 220 — الأرقام تُدمج أو تُقرأ O بدل 0.
+OCR_DPI = 600
 
 _OCR_PS = r"""
-param([string]$Path, [string]$Out)
+param([string]$Path, [string]$Out, [string]$Lang = "")
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
@@ -1832,8 +1834,18 @@ function Await($op, $type) {
 [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime] | Out-Null
 [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null
 [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime] | Out-Null
+[Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime] | Out-Null
 $engine = $null
-try { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() } catch { }
+if ($Lang) {
+    # لغة محددة أولًا: قراءة فاتورة إنجليزية بمحرّك عربي تقلب ترتيب الأكواد والأرقام
+    try {
+        $lang0 = New-Object Windows.Globalization.Language $Lang
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang0)
+    } catch { }
+}
+if (-not $engine) {
+    try { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() } catch { }
+}
 if (-not $engine) {
     foreach ($tag in @('en-US', 'ar-SA')) {
         try {
@@ -1925,8 +1937,9 @@ def _ocr_words_tesseract(img_path, scale):
     return None
 
 
-def _ocr_words_windows(img_path, scale):
-    """OCR عبر محرّك Windows المدمج (Windows 10/11) بدون أي تثبيت إضافي."""
+def _ocr_words_windows(img_path, scale, lang=None):
+    """OCR عبر محرّك Windows المدمج (Windows 10/11) بدون أي تثبيت إضافي.
+    lang مثل "en-US" لقراءة أكواد وأرقام لاتينية، أو None للغة جهاز المستخدم."""
     if os.name != "nt":
         return None
     tmp = tempfile.mkdtemp(prefix="alabbad_winocr_")
@@ -1935,8 +1948,10 @@ def _ocr_words_windows(img_path, scale):
     with open(ps1, "w", encoding="utf-8-sig") as f:
         f.write(_OCR_PS)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Path", img_path, "-Out", out],
-                          capture_output=True, text=True, creationflags=flags, timeout=180)
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Path", img_path, "-Out", out]
+    if lang:
+        cmd += ["-Lang", lang]
+    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags, timeout=180)
     if not os.path.isfile(out):
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(msg[:300] or "محرّك OCR في ويندوز لم يرجع نتيجة")
@@ -1955,12 +1970,16 @@ def _ocr_words_windows(img_path, scale):
     return words
 
 
-def ocr_image_words(img_path, scale):
-    """يرجع كلمات الصورة بإحداثيات بالنقاط (نفس مقياس PDF)."""
+def ocr_image_words(img_path, scale, lang=None):
+    """يرجع كلمات الصورة بإحداثيات بالنقاط (نفس مقياس PDF).
+    lang يُمرّر لمحرّك Windows فقط؛ Tesseract يجرّب العربية والإنجليزية معًا."""
     errs = []
     for fn in (_ocr_words_tesseract, _ocr_words_windows):
         try:
-            words = fn(img_path, scale)
+            try:
+                words = fn(img_path, scale, lang=lang) if fn is _ocr_words_windows else fn(img_path, scale)
+            except TypeError:
+                words = fn(img_path, scale)
         except Exception as e:
             errs.append(str(e))
             continue
@@ -1975,10 +1994,28 @@ def ocr_image_words(img_path, scale):
 
 
 def read_pdf_ocr_words(path, dpi=OCR_DPI):
-    """يحوّل صفحات الفاتورة إلى صور ويقرأها بالـ OCR، ثم يرجّع الكلمات بنفس شكل قراءة PDF."""
+    """يحوّل صفحات الفاتورة إلى صور ويقرأها بالـ OCR، ثم يرجّع الكلمات بنفس شكل قراءة PDF.
+    الملفات العربية تُقرأ بمحرّك لغة الجهاز، والملفات اللاتينية (أكواد وأرقام) بمحرّك إنجليزي
+    لأن المحرّك العربي يقلب ترتيب المقاطع اللاتينية ويقرأ 10.00 على أنها IO.OO."""
     imgs = render_pdf_pages(path, dpi)
     scale = 72.0 / float(dpi)
-    return [ocr_image_words(fp, scale) for fp in imgs]
+    probe = ocr_image_words(imgs[0], scale) if imgs else []
+    # نسبة الحروف العربية: الفواتير العربية تُقرأ بمحرّك الجهاز، واللاتينية بمحرّك إنجليزي
+    # (كلمة «درهم» في رأس فاتورة إنجليزية لا تعني أن الجدول عربي).
+    total_chars = sum(len(w["text"]) for w in probe) or 1
+    arabic = len(re.findall(r"[\u0600-\u06FF]", " ".join(w["text"] for w in probe)))
+    lang = None if arabic / float(total_chars) >= 0.15 else "en-US"
+    pages = []
+    for i, fp in enumerate(imgs):
+        if i == 0 and lang is None:
+            pages.append(probe)
+            continue
+        try:
+            words = ocr_image_words(fp, scale, lang=lang)
+        except Exception:
+            words = probe if i == 0 else []
+        pages.append(words)
+    return pages
 
 
 def norm_invoice_no(v):
@@ -2022,6 +2059,61 @@ def find_items(c, term="", category="", make="", state="", limit=300):
     return c.execute(sql, args).fetchall()
 
 
+def _header_text_key(t):
+    return re.sub(r"[^a-z]", "", str(t or "").lower())
+
+
+def _read_header_fields(pages):
+    """رقم الفاتورة وتاريخها من رأس الصفحة — تُقرأ حتى لو لم يُفهم جدول الأصناف."""
+    out = {"invoice_no": "", "date": ""}
+    for words in pages:
+        for ln in _group_lines(words):
+            ws = ln["words"]
+            for i, w in enumerate(ws):
+                k = _header_text_key(w["text"])
+                if not k:
+                    continue
+                # Invoice / Invoıce / lnvoice / lnvmce (OCR يخطئ في I و v)
+                if not out["invoice_no"] and k.startswith(("invo", "lnvo", "invi", "lnvi", "lnvm")):
+                    for v in ws[i + 1:]:
+                        if _header_text_key(v["text"]) in ("no", "number", "num", "#"):
+                            continue
+                        if re.search(r"\d", v["text"]):
+                            out["invoice_no"] = v["text"].strip(":")
+                            break
+                if not out["date"] and k.startswith("date"):
+                    d = _to_iso_date(" ".join(v["text"] for v in ws[i + 1:]))
+                    if d:
+                        out["date"] = d
+        if out["invoice_no"] and out["date"]:
+            break
+    return out
+
+
+def _strip_row_no(code, n):
+    """OCR يدمج رقم السطر (#) مع كود الصنف أحيانًا: 11GS-95430-C1100 أو GS-HYU-KIA-13EMULATOR."""
+    code = str(code or "")
+    if not code or not n:
+        return code
+    pref = re.match(rf"^0*{n}(?=[A-Za-z])", code)
+    if pref and len(code) - len(pref.group(0)) >= 5:
+        code = code[len(pref.group(0)):]
+    tag = f"-{n}-"
+    if tag in code and len(code.replace(tag, "-")) >= 6:
+        code = code.replace(tag, "-")
+    # GS-HYU-KIA-13EMULATOR ← رقم السطر 13 التصق داخل الكود
+    glued = re.sub(rf"(?<=-){n}(?=[A-Za-z])", "", code)
+    if glued != code and len(glued) >= 6:
+        code = glued
+    return code
+
+
+def _code_key(code):
+    """مفتاح مقارنة أكواد الموردين: OCR يخلط O/0 و I/1 و B/8 و S/5 و Z/2."""
+    key = re.sub(r"[^0-9A-Z]", "", str(code or "").upper())
+    return key.translate(str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "B": "8", "S": "5", "Z": "2"}))
+
+
 def parse_supplier_invoice(pages, stats=None):
     """يحوّل كلمات الـ PDF إلى فاتورة: رقم + تاريخ + عملة + أسطر (كود، وصف، كمية، سعر) + شحن/خصم/ضريبة."""
     res = {"invoice_no": "", "date": "", "currency": "", "supplier_guess": "", "lines": [],
@@ -2044,8 +2136,12 @@ def parse_supplier_invoice(pages, stats=None):
         res["currency"] = "SAR"
     elif re.search(r"\bUSD\b|US\$|dollar", all_text, re.I):
         res["currency"] = "USD"
+    hdr_fields = _read_header_fields(pages)
+    res["invoice_no"] = hdr_fields["invoice_no"]
+    res["date"] = hdr_fields["date"]
 
     last_page, last_row_cy = None, None
+    row_no = 0
     dbg = []
     for pi, words in enumerate(pages):
         col = _find_table_columns(words, dbg)
@@ -2114,7 +2210,10 @@ def parse_supplier_invoice(pages, stats=None):
             if i == len(centers) - 1 and totals_top is not None:
                 hi = min(hi, totals_top - 1)
             bounds.append((lo, hi))
-        for idx_row, ((lo, hi), rw) in enumerate(zip(bounds, rows), start=1):
+        for (lo, hi), rw in zip(bounds, rows):
+            # ترقيم الأسطر يستمر عبر صفحات الفاتورة (العميل يرى 13 لا 1 في الصفحة الثانية)
+            row_no += 1
+            n = row_no
             inrow = [w for w in body if lo <= _cy(w) < hi]
             nums = {"qty": [], "price": [], "total": []}
             for w in inrow:
@@ -2132,7 +2231,7 @@ def parse_supplier_invoice(pages, stats=None):
                 code = ""
                 for w in cws:
                     code += w["text"] if (not code or code.endswith("-")) else " " + w["text"]
-                code = code.replace(" ", "")
+                code = _strip_row_no(code.replace(" ", ""), n)
                 dlines = [ln["text"] for ln in desc_lines if lo <= ln["cy"] < hi]
             else:
                 dl = [ln for ln in desc_lines if lo <= ln["cy"] < hi]
@@ -2151,12 +2250,17 @@ def parse_supplier_invoice(pages, stats=None):
             if code and desc.upper().startswith(code.upper()):
                 desc = desc[len(code):].lstrip("- ")
             desc = re.sub(r"\s+", " ", desc).strip().rstrip("-").strip()
-            n = idx_row
             if qty is None or price is None or qty <= 0:
                 res["warnings"].append(f"السطر {n}: تعذّرت قراءة الكمية أو السعر — أضفه يدويًا")
                 continue
             if total is None:
                 total = round(qty * price, 2)
+            if total and abs(qty * price - total) > max(0.05, 0.02 * abs(total)):
+                # OCR قد يقرأ السعر ناقصًا (11.00 ← 1.00)؛ إجمالي السطر أدق
+                fixed = total / qty
+                if fixed > 0:
+                    price = round(fixed, 4)
+                    res["warnings"].append(f"السطر {n}: السعر لا يطابق إجمالي السطر — استُخدم الإجمالي ÷ الكمية.")
             res["lines"].append({"n": n, "code": code, "desc": desc, "qty": qty, "price": price, "total": total,
                                  "page": pi, "lo": lo, "hi": hi, "hdr": hdr})
         last_page, last_row_cy = pi, centers[-1]
@@ -3874,7 +3978,19 @@ class App(tk.Tk):
         if r:
             return r["id"]
         r = c.execute("SELECT item_id FROM item_aliases WHERE UPPER(code)=? ORDER BY (supplier=?) DESC LIMIT 1", (code, supplier or "")).fetchone()
-        return r["item_id"] if r else None
+        if r:
+            return r["item_id"]
+        # مطابقة متسامحة: OCR يقرأ 0 كأنها O و 1 كأنها I في أكواد الموردين
+        key = _code_key(code)
+        if key:
+            if supplier:
+                for r in c.execute("SELECT code,item_id FROM item_supplier_codes WHERE supplier=?", (supplier,)).fetchall():
+                    if _code_key(r["code"]) == key:
+                        return r["item_id"]
+            for r in c.execute("SELECT id,COALESCE(rep_code,'') a,COALESCE(part,'') b,COALESCE(item_no,'') c FROM items").fetchall():
+                if key in (_code_key(r["a"]), _code_key(r["b"]), _code_key(r["c"])):
+                    return r["id"]
+        return None
 
     # --------------------------------------------------------------- المبيعات
     def sales(self):
