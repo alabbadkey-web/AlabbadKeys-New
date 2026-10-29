@@ -34,12 +34,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller pdfplumber pillow certifi
+          python -m pip install pyinstaller pdfplumber pillow certifi libsql
 
       - name: Build exe
         shell: pwsh
         run: |
-          pyinstaller --onefile --windowed --name AlabbadKeys_New --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all certifi "$env:SCRIPT"
+          pyinstaller --onefile --windowed --name AlabbadKeys_New --collect-all pdfplumber --collect-all pdfminer --collect-all pypdfium2 --collect-all certifi --collect-all libsql "$env:SCRIPT"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

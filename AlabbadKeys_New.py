@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import re, sqlite3, os, sys, hashlib, secrets, hmac, shutil, tempfile, webbrowser, html, json, threading, zipfile
-import subprocess, ssl
+import subprocess, ssl, time
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.7.6"
+APP_VERSION = "16.8.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -88,7 +88,622 @@ STOCK_FILTERS = ["الكل", "نافد (0)", "2 أو أقل", "5 أو أقل", "
 STOCK_FILTER_LIMITS = {"نافد (0)": 0, "2 أو أقل": 2, "5 أو أقل": 5, "10 أو أقل": 10}
 
 
+# ------------------------------------------------------------------ السحابة (Turso)
+# وضعان: محلي (sqlite3 كما هو) أو سحابي (ملف محلي متزامن مع قاعدة Turso واحدة).
+# إعدادات السحابة في cloud.json بجانب البرنامج، أو متغيرات TURSO_DATABASE_URL / TURSO_AUTH_TOKEN.
+CLOUD_CFG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cloud.json")
+CLOUD_STATE = {"last": "", "err": "", "ready": False}
+_CLOUD_CONN = None
+_CLOUD_LOCK = threading.RLock()
+
+
+def cloud_config():
+    """(الرابط، التوكن) من ملف الإعداد أو متغيرات البيئة. فارغان = وضع محلي."""
+    url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if not url:
+        try:
+            with open(CLOUD_CFG, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            url = str(d.get("url", "")).strip()
+            token = str(d.get("token", "")).strip()
+        except Exception:
+            url, token = "", ""
+    return url, token
+
+
+def cloud_enabled():
+    """هل نشتغل على مشغّل Turso؟ (سحابي كامل أو اختبار محلي بمشغّل libsql)."""
+    if os.environ.get("CLOUD_DRIVER", "").strip().lower() in ("libsql", "turso"):
+        return True
+    url, token = cloud_config()
+    return bool(url and token)
+
+
+def cloud_replica_path():
+    """ملف النسخة المحلية المتزامنة (منفصل عن ملف قاعدة البيانات العادي)."""
+    base, _ext = os.path.splitext(DB)
+    return base + "_cloud.db"
+
+
+class CloudRow:
+    """صف يشبه sqlite3.Row: r["col"] و r[0] و dict(r) و for x in r."""
+
+    __slots__ = ("_keys", "_vals", "_idx")
+
+    def __init__(self, keys, vals):
+        self._keys = tuple(keys)
+        self._vals = tuple(vals)
+        self._idx = {str(k): i for i, k in enumerate(self._keys)}
+
+    def keys(self):
+        return list(self._keys)
+
+    def __getitem__(self, k):
+        if isinstance(k, (int, slice)):
+            return self._vals[k]
+        return self._vals[self._idx[str(k)]]
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __contains__(self, k):
+        return str(k) in self._idx
+
+    def __eq__(self, other):
+        try:
+            return tuple(self._vals) == tuple(other)
+        except Exception:
+            return False
+
+    def __repr__(self):
+        return "CloudRow(" + ", ".join(f"{k}={v!r}" for k, v in zip(self._keys, self._vals)) + ")"
+
+
+class CloudCursor:
+    """غلاف لمؤشر libsql يرجع صفوفًا بأسماء أعمدة مثل sqlite3.Row."""
+
+    def __init__(self, cur):
+        self._cur = cur
+        self._cols = [d[0] for d in (getattr(cur, "description", None) or [])]
+
+    def _wrap(self, r):
+        return None if r is None else CloudRow(self._cols, r)
+
+    def fetchone(self):
+        return self._wrap(self._cur.fetchone())
+
+    def fetchall(self):
+        return [self._wrap(r) for r in self._cur.fetchall()]
+
+    def fetchmany(self, size=None):
+        rows = self._cur.fetchmany(size) if size else self._cur.fetchmany()
+        return [self._wrap(r) for r in rows]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+_SQL_READ = re.compile(r"^\s*(SELECT|PRAGMA|WITH|EXPLAIN|VALUES)\b", re.I)
+_SQL_INSERT = re.compile(
+    r"^\s*INSERT\s+(?:(OR)\s+(?:IGNORE|REPLACE|ROLLBACK|ABORT|FAIL)\s+)?INTO\s+[\"`\[]?([A-Za-z_][\w]*)[\"`\]]?\s*"
+    r"(?:\(([^)]*)\))?\s*VALUES\s*(.+)$",
+    re.I | re.S)
+_BLOCK_SIZE = 400
+
+
+def cloud_retryable(err):
+    """أخطاء تستحق إعادة المحاولة: انشغال الملف أو انقطاع مؤقت في الشبكة."""
+    t = str(err).lower()
+    return any(s in t for s in ("locked", "connection closed", "connection reset", "timed out",
+                                 "timeout", "temporarily", "502", "503", "504", "eof", "broken pipe"))
+
+
+def sql_literal(v):
+    """قيمة SQL آمنة للاستخدام داخل executescript."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, (bytes, bytearray)):
+        return "X'" + bytes(v).hex() + "'"
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def sql_render(sql, params):
+    """يستبدل علامات ? بالقيم، بدون المساس بأي ? داخل نص بين علامتي تنصيص."""
+    if not params:
+        return sql
+    out, i, k, n = [], 0, 0, len(sql)
+    quote = None
+    while i < n:
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "?" and k < len(params):
+            out.append(sql_literal(params[k]))
+            k += 1
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+class DeferredCursor:
+    """مؤشر لأمر مؤجل (لم يُرسل بعد): يعيد رقم الصف المحجوز فقط."""
+    description = None
+    rowcount = -1
+
+    def __init__(self, lastrowid=None):
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+    def fetchmany(self, size=None):
+        return []
+
+    def __iter__(self):
+        return iter(())
+
+
+class CloudConn:
+    """اتصال واحد مشترك بمشغّل Turso، مع قفل حتى لا يتضارب الخيوط.
+
+    الكتابات تُجمع في الذاكرة وتُرسل كلها في طلب واحد عند نهاية العملية
+    (بدل طلب لكل سطر، فالحفظ يستغرق ثانية بدل عشرات الثواني).
+    أرقام الصفوف الجديدة تُحجز مسبقًا لكل جهاز حتى لا يتعارض الجهازان.
+    """
+
+    def __init__(self, conn, meta_path=None):
+        self._c = conn
+        self._buf = []
+        self._blocks = {}
+        self._cols = {}
+        self._ids_ready = False
+        self._id_tables_cache = None
+        self._meta_path = meta_path
+        try:
+            self._c.execute("PRAGMA busy_timeout=8000")
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- داخلية
+    def _read(self, sql, params=()):
+        with _CLOUD_LOCK:
+            return CloudCursor(self._c.execute(sql, params))
+
+    def _save_meta(self):
+        if not self._meta_path:
+            return
+        try:
+            data = {"cols": self._cols, "id_tables": self._id_tables_cache or {}, "blocks": self._blocks}
+            tmp = self._meta_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._meta_path)
+        except Exception:
+            pass
+
+    def _load_meta(self):
+        if not self._meta_path or not os.path.exists(self._meta_path):
+            return False
+        try:
+            with open(self._meta_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self._cols = {k: list(v) for k, v in (d.get("cols") or {}).items()}
+            self._id_tables_cache = dict(d.get("id_tables") or {})
+            self._blocks = {k: list(v) for k, v in (d.get("blocks") or {}).items()}
+            return bool(self._cols) and bool(self._id_tables_cache)
+        except Exception:
+            return False
+
+    def _flush(self):
+        if not self._buf:
+            return
+        self._save_meta()
+        with _CLOUD_LOCK:
+            pending = self._buf
+            self._buf = []
+            script = ";\n".join(sql_render(s, p) for s, p in pending)
+            for attempt in range(3):
+                try:
+                    self._c.executescript(script)
+                    return
+                except Exception as e:
+                    if cloud_retryable(e) and attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    self._buf = pending + self._buf
+                    raise
+
+    @staticmethod
+    def _parse_cols(sql):
+        """أسماء أعمدة CREATE TABLE من نص التعريف (بدون طلب إضافي)."""
+        try:
+            body = sql[sql.index("(") + 1:sql.rindex(")")]
+        except ValueError:
+            return []
+        parts, cur, depth = [], [], 0
+        for ch in body:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        parts.append("".join(cur))
+        cols = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            name = p.split()[0].strip('"`[]')
+            if name.upper() in ("PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT"):
+                continue
+            cols.append(name)
+        return cols
+
+    def warmup(self):
+        """تهيئة مرة واحدة عند بدء التشغيل: الأعمدة وحجز الأرقام لكل الجداول."""
+        if self._load_meta():
+            self._ids_ready = True
+            return
+        try:
+            rows = self._read(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+        except Exception:
+            return
+        id_tables = []
+        cache = {}
+        for r in rows:
+            sql = r["sql"] or ""
+            cols = self._parse_cols(sql)
+            if cols:
+                self._cols[r["name"]] = cols
+            has_id = bool(re.search(r"\bid\b\s+INTEGER\s+PRIMARY\s+KEY", sql, re.I))
+            cache[r["name"]] = has_id
+            if has_id:
+                id_tables.append(r["name"])
+        self._id_tables_cache = cache
+        if id_tables:
+            try:
+                self._ensure_blocks(id_tables)
+                self._reserve_all(id_tables)
+            except Exception:
+                pass
+        self._save_meta()
+
+    def _id_tables(self):
+        """كل الجداول التي فيها عمود id (من تعريف الجداول، بدون طلبات إضافية)."""
+        if not getattr(self, "_id_tables_cache", None):
+            rows = self._read("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            self._id_tables_cache = {
+                r["name"]: bool(re.search(r"\bid\b\s+INTEGER\s+PRIMARY\s+KEY", r["sql"] or "", re.I))
+                for r in rows}
+        return self._id_tables_cache
+
+    def _table_cols(self, table):
+        if table not in self._cols:
+            rows = self._read(f"PRAGMA table_info({table})").fetchall()
+            self._cols[table] = [r["name"] for r in rows]
+        return self._cols[table]
+
+    def _direct(self, sql, params=()):
+        """أمر مباشر مع إعادة محاولة عند انشغال الملف (لاختبار جهازين على ملف واحد)."""
+        for attempt in range(4):
+            try:
+                with _CLOUD_LOCK:
+                    return self._c.execute(sql, params).fetchall()
+            except Exception as e:
+                if cloud_retryable(e) and attempt < 3:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+
+    def _ensure_blocks(self, tables):
+        """ينشئ جدول الحجز ويهيّئه لكل الجداول في طلب واحد فقط."""
+        if self._ids_ready:
+            return
+        script = ["CREATE TABLE IF NOT EXISTS _id_blocks(table_name TEXT PRIMARY KEY, next_id INTEGER NOT NULL)"]
+        for t in tables:
+            script.append(
+                f"INSERT OR IGNORE INTO _id_blocks(table_name,next_id) "
+                f"VALUES('{t}', COALESCE((SELECT MAX(id)+1 FROM \"{t}\"),1))")
+        for attempt in range(4):
+            try:
+                with _CLOUD_LOCK:
+                    self._c.executescript(";\n".join(script))
+                break
+            except Exception as e:
+                if cloud_retryable(e) and attempt < 3:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        self._ids_ready = True
+
+    def _reserve_all(self, tables, size=_BLOCK_SIZE):
+        """يحجز مدى أرقام لكل الجداول المطلوبة في طلب واحد."""
+        names = ",".join("'" + t.replace("'", "''") + "'" for t in tables)
+        rows = self._direct(
+            f"UPDATE _id_blocks SET next_id = next_id + {int(size)} "
+            f"WHERE table_name IN ({names}) RETURNING table_name, next_id")
+        with _CLOUD_LOCK:
+            self._c.commit()
+        for name, new_next in rows:
+            self._blocks[name] = [int(new_next) - size, int(new_next)]
+
+    def _alloc_id(self, table):
+        blk = self._blocks.get(table)
+        if not blk or blk[0] >= blk[1]:
+            self._reserve_all([table])
+            blk = self._blocks[table]
+        nid = blk[0]
+        blk[0] += 1
+        return nid
+
+    # ---------------------------------------------------------------- عامة
+    def execute(self, sql, params=()):
+        params = tuple(params or ())
+        if _SQL_READ.match(sql):
+            self._flush()
+            return self._read(sql, params)
+
+        m = _SQL_INSERT.match(sql)
+        if m:
+            or_part = (m.group(1) + " " + m.group(2) + " ") if m.group(1) else ""
+            table = m.group(2)
+            cols = [c.strip().strip('"`[]') for c in (m.group(3) or "").split(",") if c.strip()]
+            values = m.group(4)
+            try:
+                table_cols = self._table_cols(table)
+            except Exception:
+                table_cols = []
+            if "id" in table_cols and "id" not in cols:
+                if not self._ids_ready:
+                    self._ensure_blocks([t for t, c in self._id_tables().items() if c])
+                nid = self._alloc_id(table)
+                open_paren = values.find("(")
+                if open_paren >= 0:
+                    values = values[:open_paren + 1] + sql_literal(nid) + "," + values[open_paren + 1:]
+                    if cols:
+                        new_sql = f"INSERT {or_part}INTO {table} (id,{','.join(cols)}) VALUES {values}"
+                    else:
+                        new_sql = f"INSERT {or_part}INTO {table} VALUES {values}"
+                    self._buf.append((new_sql, params))
+                    return DeferredCursor(nid)
+
+        self._buf.append((sql, params))
+        return DeferredCursor(None)
+
+    def executemany(self, sql, seq):
+        last = None
+        for row in seq:
+            last = self.execute(sql, tuple(row))
+        return last or DeferredCursor(None)
+
+    def executescript(self, sql):
+        self._flush()
+        with _CLOUD_LOCK:
+            return self._c.executescript(sql)
+
+    def commit(self):
+        self._flush()
+
+    def rollback(self):
+        self._buf = []
+
+    def close(self):
+        # الاتصال مشترك على مستوى البرنامج؛ الإغلاق لا يفعل شيئًا
+        return None
+
+    def sync(self):
+        self._flush()
+        with _CLOUD_LOCK:
+            return self._c.sync()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            try:
+                self.rollback()
+            except Exception:
+                pass
+        return False
+
+    @property
+    def row_factory(self):
+        return None
+
+    @row_factory.setter
+    def row_factory(self, _v):
+        # المشغّل يرجع صفوفًا بأسماء أعمدة دائمًا
+        return None
+
+
+def cloud_conn():
+    """يفتح (مرة واحدة) اتصال Turso، ويستخدم نسخة محلية للقراءة السريعة."""
+    global _CLOUD_CONN
+    with _CLOUD_LOCK:
+        if _CLOUD_CONN is not None:
+            return _CLOUD_CONN
+        import libsql
+        url, token = cloud_config()
+        path = cloud_replica_path()
+        try:
+            meta_path = os.path.join(os.path.dirname(CLOUD_CFG), "cloud_meta.json")
+            if url and token:
+                _CLOUD_CONN = CloudConn(libsql.connect(path, sync_url=url, auth_token=token), meta_path=meta_path)
+            else:
+                _CLOUD_CONN = CloudConn(libsql.connect(path), meta_path=meta_path)
+            try:
+                _CLOUD_CONN.warmup()
+            except Exception:
+                pass
+            CLOUD_STATE["err"] = ""
+            CLOUD_STATE["ready"] = True
+        except Exception as e:
+            CLOUD_STATE["err"] = str(e)
+            CLOUD_STATE["ready"] = False
+            raise
+        return _CLOUD_CONN
+
+
+def cloud_pull():
+    """يجلب تغييرات الجهاز الآخر. يرجع (نجح؟، رسالة)."""
+    url, token = cloud_config()
+    if not (url and token):
+        return False, "السحابة غير مربوطة"
+    try:
+        conn = cloud_conn()
+        conn.sync()
+        CLOUD_STATE["last"] = now_str()
+        CLOUD_STATE["err"] = ""
+        CLOUD_STATE["ready"] = True
+        return True, ""
+    except Exception as e:
+        CLOUD_STATE["err"] = str(e)
+        CLOUD_STATE["ready"] = False
+        return False, str(e)
+
+
+def cloud_import_local():
+    """ينسخ قاعدة البيانات المحلية (هذا الجهاز) إلى قاعدة Turso، ثم يتحقق من المجاميع."""
+    import libsql
+    url, token = cloud_config()
+    if not (url and token):
+        raise ValueError("اربط السحابة أولًا: أدخل رابط Turso والتوكن")
+    if not os.path.exists(DB):
+        raise ValueError("ملف قاعدة البيانات المحلي غير موجود: " + DB)
+
+    src = sqlite3.connect(DB)
+    src.row_factory = sqlite3.Row
+    dst = libsql.connect(url, auth_token=token)
+    copied = 0
+    try:
+        for typ, name, sql in src.execute("""SELECT type,name,sql FROM sqlite_master
+                                              WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+                                              ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END""").fetchall():
+            try:
+                dst.execute(sql)
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
+        tables = [r[0] for r in src.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()]
+        for name in tables:
+            cols = [r[1] for r in src.execute(f"PRAGMA table_info({name})").fetchall()]
+            if not cols:
+                continue
+            ph = ",".join("?" * len(cols))
+            rows = src.execute(f"SELECT {','.join(cols)} FROM {name}").fetchall()
+            for i in range(0, len(rows), 300):
+                chunk = [tuple(r) for r in rows[i:i + 300]]
+                dst.executemany(f"INSERT INTO {name} ({','.join(cols)}) VALUES ({ph})", chunk)
+            copied += len(rows)
+        dst.commit()
+
+        # تهيئة حجز أرقام الصفوف: كل جهاز يحجز مداه فلا يتعارض الجهازان
+        dst.execute("CREATE TABLE IF NOT EXISTS _id_blocks(table_name TEXT PRIMARY KEY, next_id INTEGER NOT NULL)")
+        for name in tables:
+            cols = [r[1] for r in src.execute(f"PRAGMA table_info({name})").fetchall()]
+            if "id" in cols:
+                mx = src.execute(f"SELECT COALESCE(MAX(id),0)+1 FROM {name}").fetchone()[0]
+                dst.execute("INSERT INTO _id_blocks(table_name,next_id) VALUES(?,?) "
+                            "ON CONFLICT(table_name) DO UPDATE SET next_id=MAX(next_id, excluded.next_id)",
+                            (name, int(mx)))
+        dst.commit()
+
+        # تحقق: عدد الصفوف ومجاميع المال في كل جدول
+        checks = [("items", "COUNT(*)"), ("items", "COALESCE(SUM(qty),0)"),
+                  ("items", "COALESCE(SUM(qty*buy),0)"),
+                  ("sales", "COUNT(*)"), ("sales", "COALESCE(SUM(qty*price),0)"), ("sales", "COALESCE(SUM(paid),0)"),
+                  ("purchases", "COUNT(*)"), ("purchases", "COALESCE(SUM(qty*buy),0)"),
+                  ("stock_movements", "COUNT(*)"), ("audit_log", "COUNT(*)"),
+                  ("item_supplier_costs", "COUNT(*)")]
+        diffs = []
+        for table, expr in checks:
+            if table not in tables:
+                continue
+            a = src.execute(f"SELECT {expr} FROM {table}").fetchone()[0]
+            b = dst.execute(f"SELECT {expr} FROM {table}").fetchone()[0]
+            if a is None:
+                a = 0
+            if b is None:
+                b = 0
+            if round(float(a), 2) != round(float(b), 2):
+                diffs.append(f"{table}: محلي={a} سحابي={b}")
+        if diffs:
+            raise ValueError("النسخ لم يكتمل: " + " | ".join(diffs))
+        return copied
+    finally:
+        src.close()
+        try:
+            dst.close()
+        except Exception:
+            pass
+
+
+def cloud_schema_flag():
+    return os.path.join(os.path.dirname(CLOUD_CFG), f"cloud_schema_{APP_VERSION}.flag")
+
+
+def cloud_schema_ready():
+    """هل تم تجهيز مخطط قاعدة السحابة على هذا الجهاز في هذه النسخة؟"""
+    return cloud_enabled() and os.path.exists(cloud_schema_flag())
+
+
+def cloud_mark_schema():
+    if not cloud_enabled():
+        return
+    try:
+        with open(cloud_schema_flag(), "w", encoding="utf-8") as f:
+            f.write(now_str())
+    except Exception:
+        pass
+
+
+def cloud_status_text():
+    if not cloud_enabled():
+        return "محلي"
+    if not (cloud_config()[0] and cloud_config()[1]):
+        return "اختبار محلي"
+    if CLOUD_STATE["err"]:
+        return "غير متصل"
+    return "متصل"
+
+
 def connect():
+    if cloud_enabled():
+        return cloud_conn()
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     return c
@@ -2673,6 +3288,10 @@ class App(tk.Tk):
         who = ("المدير" if self.role == "admin" else "الموظف") + " — " + self.user
         tk.Label(header, text="👤  " + who, bg=NAVY, fg="#cbd5e1", font=(FONT, 11)).pack(side="left", padx=22)
         tk.Label(header, text=f"v{APP_VERSION}", bg=NAVY, fg="#64748b", font=(FONT, 10)).pack(side="left")
+        cloud_txt = ("☁  " + cloud_status_text()) if cloud_enabled() else "💾 محلي"
+        self.cloud_lbl = tk.Label(header, text=cloud_txt, bg=NAVY, fg="#94a3b8", font=(FONT, 10), cursor="hand2")
+        self.cloud_lbl.pack(side="left", padx=10)
+        self.cloud_lbl.bind("<Button-1>", lambda e: self.cloud_settings())
         self.alert_btn = None
         if self.can("shortage"):
             self.alert_btn = tk.Button(header, text="🔔 النواقص", command=self.alerts_window, bg="#475569", fg="white",
@@ -2760,8 +3379,28 @@ class App(tk.Tk):
         try:
             self.sync_inventory(False)
         finally:
+            if cloud_enabled():
+                threading.Thread(target=self._cloud_pull_bg, daemon=True).start()
             if self.winfo_exists():
                 self.after(60000, self._auto_sync_inventory)
+
+    def _cloud_pull_bg(self):
+        """يسحب تغييرات الجهاز الآخر في الخلفية ويحدّث مؤشر الحالة."""
+        ok, _msg = cloud_pull()
+        try:
+            self.after(0, self._cloud_label_refresh)
+        except Exception:
+            pass
+
+    def _cloud_label_refresh(self):
+        lbl = getattr(self, "cloud_lbl", None)
+        if lbl is None:
+            return
+        try:
+            txt = ("☁  " + cloud_status_text()) if cloud_enabled() else "💾 محلي"
+            lbl.configure(text=txt, fg="#4ade80" if (cloud_enabled() and not CLOUD_STATE["err"]) else "#f87171")
+        except tk.TclError:
+            pass
 
     def set_active(self, key):
         self.active_nav = key
@@ -6226,6 +6865,8 @@ class App(tk.Tk):
         ttk.Button(box, text="🔑  تغيير كلمة المرور", command=self.change_pw).pack(fill="x", pady=5)
         ttk.Button(box, text="💾  نسخة احتياطية", command=self.backup).pack(fill="x", pady=5)
         ttk.Button(box, text="📄  إعداد Google Sheets", command=self.sync_from_settings).pack(fill="x", pady=5)
+        ttk.Button(box, text="☁  السحابة (جهازان + الجوال)", style="Accent.TButton",
+                   command=self.cloud_settings).pack(fill="x", pady=5)
         ttk.Button(box, text="🔄  التحقق من وجود تحديث", style="Accent.TButton", command=self.check_for_updates).pack(fill="x", pady=5)
         ttk.Button(box, text="📞  مسؤول المشتريات (واتساب النواقص)", command=self.purchasing_dialog).pack(fill="x", pady=5)
         ttk.Button(box, text="🔢  بادئات أرقام الريموت", command=self.remote_prefixes_dialog).pack(fill="x", pady=5)
@@ -8436,6 +9077,133 @@ class App(tk.Tk):
         ttk.Button(fr, text="حفظ وتجربة المزامنة", style="Accent.TButton", command=save_sheets).pack(pady=10)
         self.autosize(win, fr, 640)
 
+    # ------------------------------------------------------------------ السحابة
+    def cloud_settings(self):
+        url0, token0 = cloud_config()
+        win = tk.Toplevel(self)
+        win.title("السحابة — جهازان وقاعدة واحدة")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        fr = ttk.Frame(win, padding=18)
+        fr.pack(fill="both", expand=True)
+
+        ttk.Label(fr, text="ربط قاعدة Turso", style="Title.TLabel").pack(anchor="e")
+        ttk.Label(fr, text=("كل الأجهزة تكتب في نفس القاعدة، وكل جهاز يحتفظ بنسخة محلية للقراءة السريعة."
+                            "\nالوضع الحالي: " + cloud_status_text() +
+                            (("  |  آخر مزامنة: " + CLOUD_STATE["last"]) if CLOUD_STATE["last"] else "")),
+                  style="Muted.TLabel", justify="right").pack(anchor="e", pady=(0, 8))
+
+        ttk.Label(fr, text="رابط قاعدة البيانات (libsql://...)").pack(anchor="e", pady=4)
+        url = ttk.Entry(fr, width=78)
+        url.pack(pady=3)
+        url.insert(0, url0)
+        ttk.Label(fr, text="التوكن (Auth Token)").pack(anchor="e", pady=4)
+        token = ttk.Entry(fr, width=78, show="•")
+        token.pack(pady=3)
+        token.insert(0, token0)
+
+        status = ttk.Label(fr, text="", foreground=GREEN, justify="right")
+        status.pack(anchor="e", pady=6)
+
+        def set_status(text, color=GREEN):
+            try:
+                status.configure(text=text, foreground=color)
+            except tk.TclError:
+                pass
+
+        def bg_job(work, ok_text):
+            set_status("جارٍ العمل...", MUTED)
+
+            def runner():
+                try:
+                    msg = work()
+                    self.after(0, lambda: set_status(ok_text + ((" — " + msg) if msg else ""), GREEN))
+                except Exception as e:
+                    err = str(e)
+                    self.after(0, lambda: set_status("فشل: " + err, RED))
+
+            threading.Thread(target=runner, daemon=True).start()
+
+        def save():
+            u, t = url.get().strip(), token.get().strip()
+            if not u or not t:
+                set_status("اكتب الرابط والتوكن معًا", RED)
+                return
+            try:
+                with open(CLOUD_CFG, "w", encoding="utf-8") as f:
+                    json.dump({"url": u, "token": t}, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                set_status("تعذر الحفظ: " + str(e), RED)
+                return
+            set_status("تم الحفظ. أعد تشغيل البرنامج ليعمل على السحابة.")
+            if messagebox.askyesno("السحابة", "تم الحفظ. إعادة تشغيل البرنامج الآن؟", parent=win):
+                self._restart_app()
+
+        def test():
+            u, t = url.get().strip(), token.get().strip()
+            if not (u and t):
+                set_status("اكتب الرابط والتوكن أولًا", RED)
+                return
+
+            def work():
+                import libsql
+                c = libsql.connect(u, auth_token=t)
+                try:
+                    n = c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+                    return f"{n} جدول"
+                finally:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+
+            bg_job(work, "الاتصال ناجح")
+
+        def upload():
+            if not messagebox.askyesno("رفع البيانات",
+                                       "سيتم نسخ بيانات هذا الجهاز إلى القاعدة السحابية،\n"
+                                       "ثم مقارنة كل المجاميع تلقائيًا.\nهل نكمل؟", parent=win):
+                return
+            bg_job(cloud_import_local, "تم رفع البيانات ومطابقة المجاميع")
+
+        def sync_now():
+            def work():
+                ok, msg = cloud_pull()
+                if not ok:
+                    raise RuntimeError(msg)
+                return ""
+
+            bg_job(work, "تمت المزامنة")
+
+        def disconnect():
+            if not messagebox.askyesno("فصل السحابة", "العودة إلى قاعدة البيانات المحلية على هذا الجهاز؟", parent=win):
+                return
+            try:
+                os.remove(CLOUD_CFG)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                set_status("تعذر الحذف: " + str(e), RED)
+                return
+            set_status("تم الفصل. أعد تشغيل البرنامج.")
+
+        row = ttk.Frame(fr)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Button(row, text="حفظ وربط", style="Accent.TButton", command=save).pack(side="right", padx=4)
+        ttk.Button(row, text="اختبار الاتصال", command=test).pack(side="right", padx=4)
+        ttk.Button(row, text="مزامنة الآن", command=sync_now).pack(side="right", padx=4)
+        ttk.Button(row, text="فصل السحابة", style="Danger.TButton", command=disconnect).pack(side="left", padx=4)
+        ttk.Button(row, text="رفع بيانات هذا الجهاز", command=upload).pack(side="left", padx=4)
+        ttk.Button(row, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
+        self.autosize(win, fr, 720)
+
+    def _restart_app(self):
+        try:
+            os.execl(sys.executable, sys.executable, *sys.argv)
+        except Exception as e:
+            messagebox.showinfo("إعادة التشغيل", "أغلق البرنامج وافتحه من جديد.\n" + str(e))
+
     def change_pw(self):
         self.form("تغيير كلمة المرور", [("old", "كلمة المرور الحالية", ""), ("new", "كلمة المرور الجديدة", "")], self._change_pw)
 
@@ -8715,5 +9483,7 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    init()
+    if not cloud_schema_ready():
+        init()
+        cloud_mark_schema()
     App().mainloop()
