@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.8.0"
+APP_VERSION = "16.8.1"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -1211,6 +1211,20 @@ def init():
         CREATE INDEX IF NOT EXISTS idx_returns_sale ON sale_returns(sale_id);
         """)
 
+        # ترقية جداول البونص القديمة (أعمدة ناقصة تسبب فشل الاعتماد بصمت)
+        for tbl, add_cols in (
+            ("bonus_claims", (("status", "TEXT DEFAULT 'pending'"), ("total", "REAL DEFAULT 0"),
+                              ("note", "TEXT DEFAULT ''"), ("decided_by", "TEXT"), ("decided_at", "TEXT"),
+                              ("decision_note", "TEXT DEFAULT ''"))),
+            ("bonus_lines", (("job_id", "INTEGER"), ("job_name", "TEXT"), ("cnt", "INTEGER"),
+                             ("rate", "REAL DEFAULT 0"), ("amount", "REAL DEFAULT 0"))),
+        ):
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({tbl})").fetchall()}
+            for col_name, col_def in add_cols:
+                if col_name not in have:
+                    c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_name} {col_def}")
+        c.execute("UPDATE bonus_claims SET status='pending' WHERE status IS NULL OR status=''")
+
         # ---- المستخدمون
         ucols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
         if "perms" not in ucols:
@@ -1944,6 +1958,10 @@ def similarity(a, b):
     cb = {norm_code(x) for x in [b.get("part"), b.get("rep_code"), *(b.get("codes") or [])]} - {""}
     if ca & cb:
         return 100, ["نفس رمز المنتج"]
+    sa, sb = _sup_code_sets(a), _sup_code_sets(b)
+    for k in sa.keys() & sb.keys():
+        if not (sa[k] & sb[k]):
+            return 0, ["نفس المورد برمز مختلف — منتجان مختلفان"]
     s, why = 0, []
     if a.get("make") and a.get("make") == b.get("make"):
         s += 10
@@ -1986,10 +2004,11 @@ def similarity(a, b):
     return max(0, min(99, int(round(s)))), why
 
 
-def _item_profile(r, codes):
+def _item_profile(r, codes, sup_codes=None):
     return {"part": r["part"], "rep_code": r["rep_code"], "category": r["category"], "make": r["make"], "model": r["model"],
             "y1": r["y1"], "y2": r["y2"], "kind": r["kind"], "origin": r["origin"], "condition": r["condition"],
-            "codes": codes, "img_hash": item_image_hash(r["image"])}
+            "codes": codes, "img_hash": item_image_hash(r["image"]),
+            "supplier": r["supplier"], "sup_codes": sup_codes or {}}
 
 
 def _extra_codes(c, ids):
@@ -2002,6 +2021,31 @@ def _extra_codes(c, ids):
             for r in c.execute(f"SELECT item_id, code FROM {tbl} WHERE item_id IN ({marks})", part).fetchall():
                 out.setdefault(r["item_id"], set()).add(r["code"])
     return out
+
+
+def _supplier_code_map(c, ids):
+    """{رقم الصنف: {المورد: {رموزه المعيارية}}} من جدولي رموز الموردين والبدائل."""
+    out = {}
+    ids = list(ids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for tbl in ("item_supplier_codes", "item_aliases"):
+            for r in c.execute(f"SELECT item_id,supplier,code FROM {tbl} WHERE item_id IN ({marks}) AND COALESCE(supplier,'')<>''", part).fetchall():
+                k, cd = clean_name(r["supplier"]).lower(), norm_code(r["code"])
+                if k and cd:
+                    out.setdefault(r["item_id"], {}).setdefault(k, set()).add(cd)
+    return out
+
+
+def _sup_code_sets(p):
+    """{مورد: {رموز}} لصنف أو مرشّح (يشمل المورد ورمزه المسجلان على الصنف نفسه)."""
+    out = {k: set(v) for k, v in (p.get("sup_codes") or {}).items()}
+    sup = clean_name(p.get("supplier")).lower()
+    rc = norm_code(p.get("rep_code"))
+    if sup and rc and " / " not in sup:
+        out.setdefault(sup, set()).add(rc)
+    return {k: v for k, v in out.items() if v}
 
 
 def _named_codes(c, ids):
@@ -2057,12 +2101,13 @@ def find_similar_items(c, cand, exclude_id=None, limit=5, threshold=65):
     ids = list(pool)
     extra = _extra_codes(c, ids)
     named = _named_codes(c, ids)
+    supmap = _supplier_code_map(c, ids)
     scmap = supplier_costs_map(c, ids)
     out = []
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
         for r in c.execute(f"SELECT * FROM items WHERE id IN ({','.join('?' * len(part))})", part).fetchall():
-            sc, why = similarity(cand, _item_profile(r, extra.get(r["id"], set())))
+            sc, why = similarity(cand, _item_profile(r, extra.get(r["id"], set()), supmap.get(r["id"])))
             if sc >= threshold:
                 out.append(dict(_item_brief(r, " / ".join(named.get(r["id"], [])), scmap.get(r["id"], "")), score=sc, reasons=why))
     out.sort(key=lambda x: -x["score"])
@@ -2075,9 +2120,10 @@ def find_duplicate_pairs(c, threshold=65, limit=300):
     by_id = {r["id"]: r for r in rows}
     extra = _extra_codes(c, by_id.keys())
     named = _named_codes(c, by_id.keys())
+    supmap = _supplier_code_map(c, by_id.keys())
     scmap = supplier_costs_map(c, by_id.keys())
     ignored = {(r[0], r[1]) for r in c.execute("SELECT a_id,b_id FROM dup_ignored").fetchall()}
-    profiles = {i: _item_profile(r, extra.get(i, set())) for i, r in by_id.items()}
+    profiles = {i: _item_profile(r, extra.get(i, set()), supmap.get(i)) for i, r in by_id.items()}
     pairs = {}
 
     def add(i, j):
@@ -6355,24 +6401,44 @@ class App(tk.Tk):
             out.append((l["job_name"], l["cnt"], rate, rate * l["cnt"]))
         return out
 
+    def _fresh(self):
+        """في وضع السحابة: اسحب آخر تغييرات الأجهزة الأخرى قبل العرض."""
+        if cloud_enabled():
+            try:
+                cloud_pull()
+            except Exception:
+                pass
+
     def _decide_claim(self, claim_id, approve, note=""):
+        new_status = "approved" if approve else "rejected"
         with connect() as c:
             cl = c.execute("SELECT * FROM bonus_claims WHERE id=?", (claim_id,)).fetchone()
-            if not cl or cl["status"] != "pending":
-                raise ValueError("هذا الطلب تم البت فيه مسبقًا")
+            if not cl:
+                raise ValueError("الطلب غير موجود")
+            if (cl["status"] or "pending") != "pending":
+                raise ValueError("تم البت فيه مسبقًا (" + STATUS_AR.get(cl["status"], str(cl["status"])) + ")")
             total = 0
             if approve:
                 for l in c.execute("SELECT l.id,l.cnt,j.rate FROM bonus_lines l LEFT JOIN job_types j ON j.id=l.job_id WHERE l.claim_id=?", (claim_id,)).fetchall():
                     rate = num(l["rate"])
-                    amount = rate * l["cnt"]
+                    amount = rate * num(l["cnt"])
                     total += amount
                     c.execute("UPDATE bonus_lines SET rate=?, amount=? WHERE id=?", (rate, amount, l["id"]))
             c.execute("UPDATE bonus_claims SET status=?,total=?,decided_by=?,decided_at=?,decision_note=? WHERE id=?",
-                      ("approved" if approve else "rejected", total, self.user, now_str(), note, claim_id))
+                      (new_status, total, self.user, now_str(), note, claim_id))
+            log_audit(c, self.user, "اعتماد بونص" if approve else "رفض بونص", "bonus", claim_id,
+                      f"{cl['employee']} | {total:.2f}" + (f" | {note}" if note else ""))
+        # تحقق أن القرار انحفظ فعلًا
+        self._fresh()
+        with connect() as c:
+            chk = c.execute("SELECT status FROM bonus_claims WHERE id=?", (claim_id,)).fetchone()
+        if not chk or chk["status"] != new_status:
+            raise RuntimeError("لم يُحفظ القرار في قاعدة البيانات. أعد المحاولة، وإذا تكرر راجع الاتصال بالسحابة.")
 
     def bonus_page_admin(self):
         if self.role != "admin":
             return
+        self._fresh()
         self.clear("bonus")
         self.page_title("البونص والأعمال", "حدّد قيمة كل عمل، واعتمد طلبات الموظفين")
         nb = ttk.Notebook(self.body)
@@ -6414,6 +6480,18 @@ class App(tk.Tk):
                             iid=str(cl["id"]))
             self.refresh_badges()
 
+        def decide_many(ids, flag, note=""):
+            ok, errs = 0, []
+            for i in ids:
+                try:
+                    self._decide_claim(i, flag, note)
+                    ok += 1
+                except Exception as e:
+                    errs.append(f"طلب {i}: {e}")
+            load1()
+            load3()
+            return ok, errs
+
         def approve():
             ids = [int(i) for i in t1.selection()]
             if not ids:
@@ -6427,16 +6505,9 @@ class App(tk.Tk):
                         zero = True
             if zero and not messagebox.askyesno("تنبيه", "بعض الأعمال قيمتها 0 (لم تحدد لها مبلغًا في تبويب قيم الأعمال).\nالاعتماد سيحسبها صفر. هل تريد المتابعة؟"):
                 return
-            n = 0
-            for i in ids:
-                try:
-                    self._decide_claim(i, True)
-                    n += 1
-                except ValueError:
-                    pass
-            load1()
-            load3()
-            messagebox.showinfo("تم", f"تم اعتماد {n} طلب")
+            ok, errs = decide_many(ids, True)
+            msg = f"تم اعتماد {ok} طلب" + (("\n\nتعذّر:\n" + "\n".join(errs[:5])) if errs else "")
+            (messagebox.showwarning if errs else messagebox.showinfo)("تنبيه" if errs else "تم", msg)
 
         def reject():
             ids = [int(i) for i in t1.selection()]
@@ -6444,16 +6515,9 @@ class App(tk.Tk):
                 messagebox.showwarning("تنبيه", "حدد طلبًا أولًا")
                 return
             reason = simpledialog.askstring("رفض", "سبب الرفض (اختياري):", parent=self) or ""
-            n = 0
-            for i in ids:
-                try:
-                    self._decide_claim(i, False, reason)
-                    n += 1
-                except ValueError:
-                    pass
-            load1()
-            load3()
-            messagebox.showinfo("تم", f"تم رفض {n} طلب")
+            ok, errs = decide_many(ids, False, reason)
+            msg = f"تم رفض {ok} طلب" + (("\n\nتعذّر:\n" + "\n".join(errs[:5])) if errs else "")
+            (messagebox.showwarning if errs else messagebox.showinfo)("تنبيه" if errs else "تم", msg)
 
         def details():
             sel = t1.selection()
@@ -6480,6 +6544,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="✔ اعتماد المحدد", style="Success.TButton", command=approve).pack(side="left", padx=4)
         ttk.Button(bar, text="✖ رفض المحدد", style="Danger.TButton", command=reject).pack(side="left", padx=4)
         ttk.Button(bar, text="التفاصيل", command=details).pack(side="left", padx=4)
+        ttk.Button(bar, text="🔄 تحديث", command=lambda: (self._fresh(), load1(), load3())).pack(side="left", padx=4)
         status_cb.bind("<<ComboboxSelected>>", load1)
         t1.bind("<Double-1>", lambda e: details())
 
@@ -6574,6 +6639,34 @@ class App(tk.Tk):
         load1()
         load2()
         load3()
+
+        def auto_refresh():
+            try:
+                if self.active_nav != "bonus" or not t1.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+
+            def after_pull(_r, _e):
+                try:
+                    if not t1.winfo_exists():
+                        return
+                    st = smap.get(status_cb.get())
+                    with connect() as c:
+                        if st:
+                            rows = c.execute("SELECT id FROM bonus_claims WHERE status=? ORDER BY id DESC LIMIT 300", (st,)).fetchall()
+                        else:
+                            rows = c.execute("SELECT id FROM bonus_claims ORDER BY id DESC LIMIT 300").fetchall()
+                    if {str(r[0]) for r in rows} != set(t1.get_children()):
+                        load1()
+                        load3()
+                except tk.TclError:
+                    pass
+
+            self._run_bg(lambda: cloud_pull() if cloud_enabled() else None, after_pull)
+            self.after(30000, auto_refresh)
+
+        self.after(30000, auto_refresh)
 
     # ---------------------------------------------------------- المستخدمون والصلاحيات
     # ---------------------------------------------------------- سجل الحركة والتعديلات
@@ -8335,9 +8428,9 @@ class App(tk.Tk):
         self._import_review(parsed, path, on_done)
 
     # ------------------------------------------------------------- المشابهات والمكرر
-    def _similar_for_line(self, c, ln):
+    def _similar_for_line(self, c, ln, supplier=""):
         g = guess_item_fields(ln["code"], ln["desc"])
-        cand = {"part": ln["code"], "rep_code": ln["code"], "category": g["category"], "make": g["make"], "model": g["model"],
+        cand = {"part": ln["code"], "rep_code": ln["code"], "supplier": supplier, "category": g["category"], "make": g["make"], "model": g["model"],
                 "y1": g["y1"], "y2": g["y2"], "kind": g["kind"], "condition": g["condition"], "origin": g["origin"],
                 "img_hash": image_dhash(ln["img"]) if ln.get("img") else None}
         return find_similar_items(c, cand)
@@ -8776,7 +8869,7 @@ class App(tk.Tk):
                     if ln["manual"] or ln["skip"]:
                         continue
                     ln["item_id"] = self._match_supplier_line(c, sup, ln["code"])
-                    ln["similar"] = [] if ln["item_id"] else self._similar_for_line(c, ln)
+                    ln["similar"] = [] if ln["item_id"] else self._similar_for_line(c, ln, sup)
             refresh()
 
         def on_cur(*_):
@@ -8812,7 +8905,7 @@ class App(tk.Tk):
             ln = lines[idx]
             if not ln.get("_dup_asked"):
                 with connect() as c_:
-                    sims_ = self._similar_for_line(c_, ln)
+                    sims_ = self._similar_for_line(c_, ln, sup_cb.get().strip())
                 ln["similar"] = sims_
                 if sims_:
                     ln["_dup_asked"] = True
@@ -8878,7 +8971,7 @@ class App(tk.Tk):
             if idx is None:
                 return
             with connect() as c_:
-                sims_ = self._similar_for_line(c_, lines[idx])
+                sims_ = self._similar_for_line(c_, lines[idx], sup_cb.get().strip())
             if not sims_:
                 messagebox.showinfo("المشابهات", "ما وجدت أصنافًا مشابهة لهذا السطر.", parent=win)
                 return
