@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.8.1"
+APP_VERSION = "16.8.2"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -330,6 +330,10 @@ class CloudConn:
             for attempt in range(3):
                 try:
                     self._c.executescript(script)
+                    try:
+                        self._c.sync()  # تحديث النسخة المحلية فورًا ليرى البرنامج ما كتبه
+                    except Exception:
+                        pass
                     return
                 except Exception as e:
                     if cloud_retryable(e) and attempt < 2:
@@ -3720,7 +3724,12 @@ class App(tk.Tk):
         with connect() as c:
             types = [r["name"] for r in c.execute("SELECT name FROM item_types ORDER BY name").fetchall()]
             sups = [r["name"] for r in c.execute("SELECT name FROM suppliers ORDER BY name").fetchall()] if show_sup else []
+            makes_f = [r["name"] for r in c.execute("SELECT name FROM car_makes ORDER BY name").fetchall()]
 
+        ttk.Label(adv, text="الشركة").grid(row=2, column=5, padx=4, pady=3)
+        make_cb = ttk.Combobox(adv, values=["الكل"] + makes_f, state="readonly", width=16)
+        make_cb.set("الكل")
+        make_cb.grid(row=2, column=4, padx=4)
         ttk.Label(adv, text="نوع القطعة").grid(row=0, column=5, padx=4, pady=3)
         cat = ttk.Combobox(adv, values=["الكل"] + types, state="readonly", width=16)
         cat.set("الكل")
@@ -3814,9 +3823,10 @@ class App(tk.Tk):
                     AND (?='الكل' OR COALESCE(i.supplier,'')=? OR EXISTS(SELECT 1 FROM purchases p WHERE p.item_id=i.id AND p.supplier=?))
                     AND COALESCE(i.car,'') LIKE ?
                     AND (?='' OR COALESCE(i.y1,'') LIKE ? OR COALESCE(i.y2,'') LIKE ?)
+                    AND (?='الكل' OR COALESCE(i.make,'')=? OR COALESCE(i.car,'') LIKE ?)
                     AND (?=0 OR COALESCE(i.incomplete,0)=1)
                     ORDER BY i.id DESC
-                """, (query, query, query, query, query, query, query, cat.get(), cat.get(), sup.get(), sup.get(), sup.get(), cq, y, "%" + y + "%", "%" + y + "%", inc_var.get())).fetchall()
+                """, (query, query, query, query, query, query, query, cat.get(), cat.get(), sup.get(), sup.get(), sup.get(), cq, y, "%" + y + "%", "%" + y + "%", make_cb.get(), make_cb.get(), "%" + make_cb.get() + "%", inc_var.get())).fetchall()
 
             clear_tree(t)
             shown = 0
@@ -3871,6 +3881,7 @@ class App(tk.Tk):
         for widget in (q, carq, yearq):
             widget.bind("<Return>", lambda e: load())
         cat.bind("<<ComboboxSelected>>", lambda e: load())
+        make_cb.bind("<<ComboboxSelected>>", lambda e: load())
         sup.bind("<<ComboboxSelected>>", lambda e: load())
         stock.bind("<<ComboboxSelected>>", lambda e: load())
         t.bind("<Double-1>", lambda e: self.view_image(int(t.selection()[0])) if t.selection() else None)
@@ -5688,6 +5699,7 @@ class App(tk.Tk):
             if changes:
                 msg += "\n\nتحديث التكلفة (متوسط مرجّح):\n" + "\n".join(changes[:10]) + ("\n..." if len(changes) > 10 else "")
             messagebox.showinfo("تم", msg)
+            self.offer_purchase_labels(ids)
 
         def all_pending():
             with connect() as c:
@@ -5770,6 +5782,7 @@ class App(tk.Tk):
                     return
                 messagebox.showinfo("تم", f"تمت إضافة {n_} سطر للمخزون." +
                                     ("\n\n" + "\n".join(ch_[:10]) if ch_ else ""), parent=win)
+                self.offer_purchase_labels(pending_ids, win)
                 win.destroy()
                 load()
 
@@ -5822,6 +5835,7 @@ class App(tk.Tk):
         """يضيف الأسطر للمخزون، ويحسب التكلفة بالمتوسط المرجّح بدل استبدال التكلفة القديمة."""
         n = 0
         changes = []
+        expect = {}
         with connect() as c:
             for pid in ids:
                 p = c.execute("SELECT * FROM purchases WHERE id=? AND status='pending'", (pid,)).fetchone()
@@ -5836,6 +5850,8 @@ class App(tk.Tk):
                 q0 = max(int(it["qty"] or 0), 0)
                 b0 = num(it["buy"])
                 e0 = num(it["expense"])
+                ex_ = expect.setdefault(p["item_id"], [q0, 0])
+                ex_[1] += q1
                 # إذا كانت تكلفة المخزون القديم غير معروفة (صنف ناقص) أو لا يوجد مخزون: نأخذ التكلفة الجديدة كاملة
                 unknown = bool(it["incomplete"]) or (b0 + e0) <= 0 or q0 <= 0
                 if unknown:
@@ -5862,7 +5878,52 @@ class App(tk.Tk):
                     changes.append(f"{it['part']}: تكلفة جديدة {sar(new_cost)}")
                 elif abs(old_cost - new_cost) > 0.004:
                     changes.append(f"{it['part']}: {sar(old_cost)} ← {sar(new_cost)}  (سعر الشراء الجديد {sar(b1 + e1)})")
+        # تحقق: هل الكمية انضافت فعلًا في قاعدة البيانات؟
+        self._fresh()
+        bad = []
+        with connect() as c:
+            for iid, (q_before, q_add) in expect.items():
+                r = c.execute("SELECT item_no,qty FROM items WHERE id=?", (iid,)).fetchone()
+                if not r or int(num(r["qty"])) < q_before + q_add:
+                    bad.append(f"{r['item_no'] if r else iid}: المتوقع {q_before + q_add} الموجود {int(num(r['qty'])) if r else 0}")
+        if bad:
+            raise RuntimeError("تم تسجيل الاستلام لكن الكمية لم تظهر في المخزون لهذه الأصناف:\n" + "\n".join(bad[:8]) +
+                               "\n\nاضغط (مزامنة الآن) من إعدادات السحابة ثم افتح المخزون من جديد، وإن بقيت صفرًا أرسل لي هذه الرسالة.")
         return n, changes
+
+    # ------------------------------------------------------------- طباعة باركود أصناف الفاتورة
+    def purchase_label_entries(self, purchase_ids):
+        """ملصق لكل قطعة من الأصناف التي في أسطر الشراء (مجمّعة لكل صنف)."""
+        entries, seen = [], {}
+        with connect() as c:
+            for pid in purchase_ids:
+                r = c.execute("""SELECT p.qty,i.id iid,i.item_no,i.part,i.retail,i.category,i.make,i.model,i.car,i.kind,i.origin
+                                 FROM purchases p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?""", (int(pid),)).fetchone()
+                if not r or not r["item_no"]:
+                    continue
+                n = max(int(num(r["qty"])), 1)
+                if r["iid"] in seen:
+                    seen[r["iid"]]["count"] += n
+                    continue
+                e = {"item_no": r["item_no"], "name": barcode_label_name(r) or r["part"], "part": r["part"],
+                     "price": r["retail"], "count": n, "sup": ""}
+                seen[r["iid"]] = e
+                entries.append(e)
+        return entries
+
+    def offer_purchase_labels(self, purchase_ids, parent=None):
+        """بعد إضافة فاتورة: يسأل هل تريد طباعة الباركود لأصنافها (ملصق لكل قطعة)."""
+        try:
+            entries = self.purchase_label_entries(purchase_ids)
+        except Exception:
+            return
+        if not entries:
+            return
+        total = sum(e["count"] for e in entries)
+        if messagebox.askyesno("🖨 طباعة الباركود",
+                               f"أصناف الفاتورة: {len(entries)}   |   عدد الملصقات: {total} (ملصق لكل قطعة)\n\nهل تريد طباعة الباركود الآن؟",
+                               parent=parent or self):
+            self._print_labels(entries)
 
     def new_purchase(self, on_done=None):
         with connect() as c:
@@ -9069,17 +9130,27 @@ class App(tk.Tk):
                 except Exception as e:
                     messagebox.showwarning("الصور", f"تم حفظ الفاتورة لكن تعذّر حفظ بعض الصور:\n{e}", parent=win)
             msg = f"تم تسجيل فاتورة الشراء {inv} ({n} صنف) بحالة معلّقة.\nعند استلام البضاعة حدد الفاتورة واضغط (إضافة الفاتورة المحددة للمخزون)."
+            with connect() as c:
+                all_ids = [r[0] for r in c.execute("SELECT id FROM purchases WHERE batch=? AND supplier=?", (inv, sup)).fetchall()]
+            recv_err = ""
             if receive_now:
                 with connect() as c:
                     ids = [r[0] for r in c.execute("SELECT id FROM purchases WHERE batch=? AND supplier=? AND status='pending'", (inv, sup)).fetchall()]
-                n2, changes = self._receive_purchases(ids)
-                msg = f"تم تسجيل الفاتورة {inv} وإضافة {n2} صنف إلى المخزون."
-                if changes:
-                    msg += "\n\nتحديث التكلفة (متوسط مرجّح):\n" + "\n".join(changes[:10]) + ("\n..." if len(changes) > 10 else "")
+                try:
+                    n2, changes = self._receive_purchases(ids)
+                    msg = f"تم تسجيل الفاتورة {inv} وإضافة {n2} صنف إلى المخزون."
+                    if changes:
+                        msg += "\n\nتحديث التكلفة (متوسط مرجّح):\n" + "\n".join(changes[:10]) + ("\n..." if len(changes) > 10 else "")
+                except Exception as e:
+                    recv_err = str(e)
             win.destroy()
             if on_done:
                 on_done()
-            messagebox.showinfo("تم", msg)
+            if recv_err:
+                messagebox.showerror("الاستلام", f"سُجّلت الفاتورة {inv} لكن:\n{recv_err}")
+            else:
+                messagebox.showinfo("تم", msg)
+            self.offer_purchase_labels(all_ids)
 
         ttk.Button(acts, text="＋ إنشاء صنف جديد للسطر المحدد", style="Accent.TButton", command=create_sel).pack(side="right", padx=4)
         ttk.Button(acts, text="⏩ إنشاء كل الأصناف الناقصة بالتتابع", command=create_all).pack(side="right", padx=4)
