@@ -9,7 +9,7 @@ from pathlib import Path
 DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.8.2"
+APP_VERSION = "16.8.3"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -5716,9 +5716,7 @@ class App(tk.Tk):
             if not entries:
                 messagebox.showwarning("تنبيه", "حدد سطرًا أو أكثر من المشتريات أولًا")
                 return
-            total = sum(e["count"] for e in entries)
-            if messagebox.askyesno("طباعة الباركود", f"سيتم طباعة {total} ملصق (ملصق لكل قطعة) برمز المورد على الباركود. متابعة؟"):
-                self._print_labels(entries)
+            self.labels_dialog(entries)
 
         def open_invoice(batch=None):
             """يعرض كل أصناف فاتورة الشراء برقمها مع الكميات والأسعار والإجمالي."""
@@ -5912,18 +5910,67 @@ class App(tk.Tk):
         return entries
 
     def offer_purchase_labels(self, purchase_ids, parent=None):
-        """بعد إضافة فاتورة: يسأل هل تريد طباعة الباركود لأصنافها (ملصق لكل قطعة)."""
+        """بعد إضافة فاتورة: يسأل هل تريد طباعة الباركود، ثم تحدد أنت عدد الملصقات لكل صنف."""
         try:
             entries = self.purchase_label_entries(purchase_ids)
         except Exception:
             return
         if not entries:
             return
-        total = sum(e["count"] for e in entries)
         if messagebox.askyesno("🖨 طباعة الباركود",
-                               f"أصناف الفاتورة: {len(entries)}   |   عدد الملصقات: {total} (ملصق لكل قطعة)\n\nهل تريد طباعة الباركود الآن؟",
+                               f"أصناف الفاتورة: {len(entries)}\n\nهل تريد طباعة ملصقات الباركود؟ (تحدد العدد لكل صنف)",
                                parent=parent or self):
-            self._print_labels(entries)
+            self.labels_dialog(entries)
+
+    def labels_dialog(self, entries):
+        """نافذة تحدد فيها عدد الملصقات لكل صنف (الافتراضي 1، و0 = لا تطبع الصنف)."""
+        win = tk.Toplevel(self)
+        win.title("🖨 طباعة الباركود — حدد عدد الملصقات")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.grab_set()
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(side="bottom", fill="x")
+        frame = self.scroll_area(win)
+        frame.columnconfigure(2, weight=1)
+        ttk.Label(frame, text="اكتب عدد الملصقات التي تريدها لكل صنف (0 = لا تطبع هذا الصنف)", style="Sub.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="e", pady=(0, 8))
+        for col, txt in ((2, "الصنف"), (1, "الكمية في الفاتورة"), (0, "عدد الملصقات")):
+            ttk.Label(frame, text=txt, font=(FONT, 10, "bold")).grid(row=1, column=col, sticky="e", padx=6, pady=(0, 4))
+        rows = []
+        for i, e in enumerate(entries, start=2):
+            ttk.Label(frame, text=f"{e['item_no']}  |  {e['name']}  |  رقم القطعة: {e['part'] or '-'}", anchor="e",
+                      justify="right").grid(row=i, column=2, sticky="e", padx=6, pady=4)
+            ttk.Label(frame, text=str(e["count"])).grid(row=i, column=1, padx=6)
+            sp = ttk.Spinbox(frame, from_=0, to=500, width=6, justify="center")
+            sp.set(1)
+            sp.grid(row=i, column=0, padx=6)
+            rows.append((e, sp))
+
+        def fill(mode):
+            for e, sp in rows:
+                sp.set(e["count"] if mode == "qty" else 1)
+
+        def do_print():
+            out, total = [], 0
+            for e, sp in rows:
+                n = max(0, min(int(num(sp.get())), 500))
+                if n > 0:
+                    out.append(dict(e, count=n))
+                    total += n
+            if not out:
+                messagebox.showwarning("تنبيه", "اكتب عددًا أكبر من صفر لصنف واحد على الأقل", parent=win)
+                return
+            if total > 300 and not messagebox.askyesno("تأكيد", f"سيتم طباعة {total} ملصق. متابعة؟", parent=win):
+                return
+            win.destroy()
+            self._print_labels(out)
+
+        ttk.Button(bar, text="🖨  طباعة", style="Success.TButton", command=do_print).pack(side="right", padx=6, ipadx=20, ipady=3)
+        ttk.Button(bar, text="العدد = كمية الفاتورة", command=lambda: fill("qty")).pack(side="left", padx=4)
+        ttk.Button(bar, text="العدد = 1", command=lambda: fill("one")).pack(side="left", padx=4)
+        ttk.Button(bar, text="إلغاء", command=win.destroy).pack(side="left", padx=4)
+        self.dialog_size(win, frame, bar, 820)
 
     def new_purchase(self, on_done=None):
         with connect() as c:
