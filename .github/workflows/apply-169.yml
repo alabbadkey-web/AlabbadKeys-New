@@ -1,6 +1,6 @@
 name: تطبيق تحديث 16.9.0
 
-# مهمة لمرة واحدة: تطبّق التعديل الجاهز على الكود، ثم تحذف ملفاتها المؤقتة.
+# مهمة لمرة واحدة: تطبّق تعديل الكود الجاهز ثم تشغّل البناء.
 on:
   push:
     branches: [main]
@@ -28,29 +28,32 @@ jobs:
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: تطبيق التعديل
+      - name: تطبيق تعديل الكود
         if: steps.parts.outputs.ok == 'true'
         run: |
           set -euo pipefail
           cat _apply/fix.part* | base64 -d | gunzip > /tmp/fix.patch
-          git apply --check /tmp/fix.patch
-          git apply /tmp/fix.patch
+          if git apply --check --include=AlabbadKeys_New.py /tmp/fix.patch; then
+            git apply --include=AlabbadKeys_New.py /tmp/fix.patch
+            echo "تم تطبيق التعديل"
+          else
+            echo "التعديل مطبّق من قبل"
+          fi
           python3 -c "compile(open('AlabbadKeys_New.py', encoding='utf-8').read(), 'AlabbadKeys_New.py', 'exec')"
-          rm -rf _apply .github/workflows/apply-169.yml
 
-      - name: حفظ التعديل ونشره
+      - name: حفظ الكود المعدّل
         if: steps.parts.outputs.ok == 'true'
         run: |
           set -euo pipefail
           git config user.name "alabbadkey-web"
           git config user.email "alabbadkey-web@users.noreply.github.com"
-          rm -rf __pycache__
-          git add -A
-          git commit -m "تحديث 16.9.0: طلب النواقص PDF، مزامنة سحابية في الخلفية، دعم ويندوز 7، العمل من أي مجلد
-
-          🤖 Generated with Codebuff
-          Co-Authored-By: Codebuff <noreply@codebuff.com>"
-          git push
+          git add AlabbadKeys_New.py
+          if git diff --cached --quiet; then
+            echo "لا يوجد تغيير جديد"
+          else
+            git commit -m "تحديث 16.9.0: طلب النواقص PDF، مزامنة سحابية في الخلفية، دعم ويندوز 7، العمل من أي مجلد"
+            git push
+          fi
 
       - name: تشغيل بناء البرنامج
         if: steps.parts.outputs.ok == 'true'
