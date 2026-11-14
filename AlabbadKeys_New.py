@@ -28,7 +28,7 @@ APP_DIR = _app_dir()
 DB = os.path.join(APP_DIR, "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.9.0"
+APP_VERSION = "16.9.1"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -8159,6 +8159,8 @@ class App(tk.Tk):
         brow = ttk.Frame(bar)
         brow.pack(fill="x", pady=4)
         issue_text = "📤  إصدار طلب الشراء وإرساله للمورد (واتساب)" if is_admin else "📤  إصدار الطلب وإرساله لجوال مسؤول المشتريات (واتساب)"
+        ttk.Button(brow, text="📄  إصدار طلب النواقص PDF", command=lambda: po_pdf(False)).pack(side="right", ipadx=10, ipady=5, padx=(0, 6))
+        ttk.Button(brow, text="📄  PDF + واتساب", style="Accent.TButton", command=lambda: po_pdf(True)).pack(side="right", ipadx=10, ipady=5, padx=(0, 6))
         ttk.Button(brow, text=issue_text, style="Success.TButton", command=lambda: issue()).pack(side="right", ipadx=16, ipady=5)
         if is_admin:
             ttk.Button(brow, text="⚙ جوال المدير لاستلام طلبات الموظفين", command=lambda: self.manager_phone_dialog(refresh_dest)).pack(side="left")
@@ -8345,6 +8347,15 @@ class App(tk.Tk):
                 unknown = sum(1 for ln in lines if not ln.get("cost"))
                 total_txt += f"   |   التكلفة التقديرية: {sar(est)}" + (f"   ({unknown} صنف بدون سعر)" if unknown else "")
             total_var.set(total_txt)
+
+        def po_pdf(send_whatsapp=False):
+            """يصدر أصناف الطلب الحالية كملف PDF (نفس طلب النواقص) — جاهز للإرسال أو الطباعة."""
+            if not lines:
+                messagebox.showwarning("تنبيه", "أضف أصنافًا للطلب أولًا")
+                return
+            ids = [str(ln["id"]) for ln in lines]
+            need = {str(ln["id"]): ln["qty"] for ln in lines}
+            self.shortage_pdf(ids, need, send_whatsapp=send_whatsapp)
 
         def add_line(r, q):
             for ln in lines:
