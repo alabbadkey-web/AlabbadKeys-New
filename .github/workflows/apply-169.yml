@@ -1,0 +1,59 @@
+name: تطبيق تحديث 16.9.0
+
+# مهمة لمرة واحدة: تطبّق التعديل الجاهز على الكود، ثم تحذف ملفاتها المؤقتة.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: هل الأجزاء موجودة
+        id: parts
+        run: |
+          if [ -f _apply/fix.part00 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: تطبيق التعديل
+        if: steps.parts.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          cat _apply/fix.part* | base64 -d | gunzip > /tmp/fix.patch
+          git apply --check /tmp/fix.patch
+          git apply /tmp/fix.patch
+          python3 -c "compile(open('AlabbadKeys_New.py', encoding='utf-8').read(), 'AlabbadKeys_New.py', 'exec')"
+          rm -rf _apply .github/workflows/apply-169.yml
+
+      - name: حفظ التعديل ونشره
+        if: steps.parts.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "alabbadkey-web"
+          git config user.email "alabbadkey-web@users.noreply.github.com"
+          rm -rf __pycache__
+          git add -A
+          git commit -m "تحديث 16.9.0: طلب النواقص PDF، مزامنة سحابية في الخلفية، دعم ويندوز 7، العمل من أي مجلد
+
+          🤖 Generated with Codebuff
+          Co-Authored-By: Codebuff <noreply@codebuff.com>"
+          git push
+
+      - name: تشغيل بناء البرنامج
+        if: steps.parts.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build.yml
