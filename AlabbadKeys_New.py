@@ -6,10 +6,29 @@ import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-DB = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_keys_new.db")
+def _app_dir():
+    """مجلد بيانات البرنامج: بجانب الملف إن كان قابلًا للكتابة، وإلا في مجلد المستخدم.
+    بهذا يعمل البرنامج من أي مكان (سطح المكتب، فلاش، مجلد بدون صلاحيات كتابة)."""
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    user_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "AlabbadKeys")
+    for d in (here, user_dir):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return here
+
+
+APP_DIR = _app_dir()
+DB = os.path.join(APP_DIR, "alabbad_keys_new.db")
 
 # ------------------------------------------------------------------ الألوان والخط
-APP_VERSION = "16.8.3"
+APP_VERSION = "16.9.0"
 GITHUB_REPO = "alabbadkey-web/AlabbadKeys-New"
 UPDATE_ASSET_NAME = "AlabbadKeys_New.exe"
 FONT = "Segoe UI"
@@ -91,8 +110,9 @@ STOCK_FILTER_LIMITS = {"نافد (0)": 0, "2 أو أقل": 2, "5 أو أقل": 5
 # ------------------------------------------------------------------ السحابة (Turso)
 # وضعان: محلي (sqlite3 كما هو) أو سحابي (ملف محلي متزامن مع قاعدة Turso واحدة).
 # إعدادات السحابة في cloud.json بجانب البرنامج، أو متغيرات TURSO_DATABASE_URL / TURSO_AUTH_TOKEN.
-CLOUD_CFG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "cloud.json")
-CLOUD_STATE = {"last": "", "err": "", "ready": False}
+CLOUD_CFG = os.path.join(APP_DIR, "cloud.json")
+CLOUD_STATE = {"last": "", "err": "", "ready": False, "dirty": False, "last_ts": 0.0}
+_CLOUD_SYNC_WORKER = {"thread": None}
 _CLOUD_CONN = None
 _CLOUD_LOCK = threading.RLock()
 
@@ -118,6 +138,80 @@ def cloud_enabled():
         return True
     url, token = cloud_config()
     return bool(url and token)
+
+
+# كم ثانية بين مزامنة وأخرى مع Turso. 0 = مزامنة فورية بعد كل حفظ.
+CLOUD_SYNC_GAP = {"seconds": None}
+
+
+def cloud_sync_gap():
+    global CLOUD_SYNC_GAP
+    if CLOUD_SYNC_GAP["seconds"] is None:
+        try:
+            CLOUD_SYNC_GAP["seconds"] = max(0.0, float(setting("cloud_sync_seconds") or 20))
+        except Exception:
+            CLOUD_SYNC_GAP["seconds"] = 20.0
+    return CLOUD_SYNC_GAP["seconds"]
+
+
+def _cloud_sync_request():
+    """يطلب رفع التغييرات للسحابة في الخلفية. لا ينتظر الشبكة أبدًا (لا يبطئ البرنامج)."""
+    CLOUD_STATE["dirty"] = True
+    t = _CLOUD_SYNC_WORKER.get("thread")
+    if t is not None and t.is_alive():
+        return
+    try:
+        t = threading.Thread(target=_cloud_sync_loop, name="cloud-sync", daemon=True)
+        _CLOUD_SYNC_WORKER["thread"] = t
+        t.start()
+    except Exception:
+        pass
+
+
+def _cloud_sync_loop():
+    """حلقة المزامنة: ترفع ما لم يُرفع كل الفاصل المحدد، وتتوقف وحدها عند الخمول."""
+    idle_rounds, failures = 0, 0
+    while True:
+        gap = cloud_sync_gap()
+        time.sleep(0.4 if gap <= 0 else min(max(gap / 4.0, 0.4), 3.0))
+        if not CLOUD_STATE.get("dirty"):
+            idle_rounds += 1
+            if idle_rounds >= 400:      # ~دقيقتين بدون أي حفظ: نوقف الخيط
+                return
+            continue
+        idle_rounds = 0
+        if gap > 0 and time.time() - CLOUD_STATE.get("last_ts", 0.0) < gap:
+            continue
+        conn = _CLOUD_CONN
+        if conn is None:
+            CLOUD_STATE["dirty"] = False
+            return
+        # نرفع وقت هدوئك فقط (ما دام فيه استخدام قبل أقل من 1.5 ثانية ننتظر)،
+        # وبحد أقصى 15 ثانية حتى لا يتأخر الرفع كثير.
+        if time.time() - CLOUD_STATE.get("last_db_ts", 0.0) < 1.5:
+            since = CLOUD_STATE.get("quiet_since") or time.time()
+            CLOUD_STATE["quiet_since"] = since
+            if time.time() - since < 15:
+                CLOUD_STATE["dirty"] = True
+                continue
+        CLOUD_STATE["quiet_since"] = 0.0
+        CLOUD_STATE["dirty"] = False
+        try:
+            conn.sync_now()
+            CLOUD_STATE["last_ts"] = time.time()
+            CLOUD_STATE["last"] = now_str()
+            CLOUD_STATE["err"] = ""
+            CLOUD_STATE["ready"] = True
+            failures = 0
+        except Exception as e:
+            CLOUD_STATE["err"] = str(e)
+            CLOUD_STATE["ready"] = False
+            failures += 1
+            if failures >= 6:           # الشبكة مقطوعة: نتوقف ونترك المحاولة للحفظة القادمة
+                CLOUD_STATE["dirty"] = False
+                return
+            CLOUD_STATE["dirty"] = True
+            time.sleep(2.0 * failures)
 
 
 def cloud_replica_path():
@@ -291,6 +385,7 @@ class CloudConn:
 
     # ---------------------------------------------------------------- داخلية
     def _read(self, sql, params=()):
+        CLOUD_STATE["last_db_ts"] = time.time()
         with _CLOUD_LOCK:
             return CloudCursor(self._c.execute(sql, params))
 
@@ -323,6 +418,7 @@ class CloudConn:
         if not self._buf:
             return
         self._save_meta()
+        CLOUD_STATE["last_db_ts"] = time.time()
         with _CLOUD_LOCK:
             pending = self._buf
             self._buf = []
@@ -330,10 +426,9 @@ class CloudConn:
             for attempt in range(3):
                 try:
                     self._c.executescript(script)
-                    try:
-                        self._c.sync()  # تحديث النسخة المحلية فورًا ليرى البرنامج ما كتبه
-                    except Exception:
-                        pass
+                    # الحفظ محلي فوري. الرفع للسحابة يصير في خيط خلفي،
+                    # فما ننتظر الإنترنت ولا يبطؤ البرنامج أبدًا.
+                    _cloud_sync_request()
                     return
                 except Exception as e:
                     if cloud_retryable(e) and attempt < 2:
@@ -525,10 +620,20 @@ class CloudConn:
         # الاتصال مشترك على مستوى البرنامج؛ الإغلاق لا يفعل شيئًا
         return None
 
-    def sync(self):
-        self._flush()
+    def sync_now(self):
+        """مزامنة الشبكة فقط — تُستدعى من خيط الخلفية."""
         with _CLOUD_LOCK:
             return self._c.sync()
+
+    def sync(self):
+        """مزامنة فورية عند طلب المستخدم (مزامنة الآن / سحب تغييرات الجهاز الآخر)."""
+        self._flush()
+        with _CLOUD_LOCK:
+            out = self._c.sync()
+        CLOUD_STATE["dirty"] = False
+        CLOUD_STATE["last_ts"] = time.time()
+        CLOUD_STATE["last"] = now_str()
+        return out
 
     def __enter__(self):
         return self
@@ -742,6 +847,76 @@ def normalize_phone(value):
     elif len(digits) == 9 and digits.startswith("5"):
         digits = "966" + digits
     return digits
+
+# ------------------------------------------------------------------ طلب النواقص PDF
+def shortage_reports_dir():
+    """مجلد طلبات النواقص (بجانب البرنامج) — يُنشأ تلقائيًا."""
+    for d in (os.path.join(APP_DIR, "طلبات النواقص"),
+              os.path.join(tempfile.gettempdir(), "طلبات النواقص")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            continue
+    return tempfile.gettempdir()
+
+
+def browser_exe_path():
+    """مسار Edge أو Chrome لعمل PDF من صفحة HTML بدون أي مكتبات إضافية."""
+    if os.name != "nt":
+        for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge"):
+            p = shutil.which(name)
+            if p:
+                return p
+        return ""
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    for p in (os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+              os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+              os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(local, "Google", "Chrome", "Application", "chrome.exe")):
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+
+def html_to_pdf(html_text, pdf_path):
+    """يحوّل HTML إلى PDF بصمت. يرجع True إذا نجح."""
+    exe = browser_exe_path()
+    if not exe:
+        return False
+    tmp_html = os.path.join(tempfile.gettempdir(),
+                            "shortage_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".html")
+    profile = os.path.join(tempfile.gettempdir(), "shortage_pdf_profile")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        with open(tmp_html, "w", encoding="utf-8") as f:
+            f.write(html_text)
+        uri = Path(tmp_html).as_uri()
+        for headless in ("--headless=new", "--headless"):
+            try:
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+            except Exception:
+                pass
+            cmd = [exe, headless, "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                   "--user-data-dir=" + profile, "--no-pdf-header-footer",
+                   "--print-to-pdf=" + pdf_path, uri]
+            try:
+                subprocess.run(cmd, timeout=90, creationflags=flags,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                continue
+            if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 800:
+                return True
+        return False
+    finally:
+        try:
+            os.remove(tmp_html)
+        except Exception:
+            pass
 
 
 def now_str():
@@ -1134,7 +1309,7 @@ def launch_update_installer(new_exe):
 
 
 # ------------------------------------------------------------------ صور المنتجات
-IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "alabbad_item_images_new")
+IMG_DIR = os.path.join(APP_DIR, "alabbad_item_images_new")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
 
@@ -3417,7 +3592,7 @@ class App(tk.Tk):
 
         if not getattr(self, "_auto_sync_started", False):
             self._auto_sync_started = True
-            self.after(1500, lambda: self.sync_inventory(False))
+            self.after(1500, self._auto_sheets_if_changed)
             self.after(60000, self._auto_sync_inventory)
 
         self.after(1200, self.check_stock_alerts)
@@ -3425,9 +3600,24 @@ class App(tk.Tk):
             self._alert_loop_started = True
             self.after(60000, self._stock_alert_tick)
 
+    def _auto_sheets_if_changed(self):
+        """يرفع المخزون لـ Google Sheets تلقائيًا فقط إذا تغيّر شيء (وكل 5 دقائق على الأكثر)."""
+        if not (setting("sheets_url").strip() and setting("sheets_token").strip()):
+            return
+        with connect() as c:
+            row = c.execute("SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(SUM(qty),0), "
+                            "COALESCE(SUM(retail),0) FROM items").fetchone()
+        sig = tuple(row) if row else None
+        if sig is not None and sig == getattr(self, "_sheets_sig", None):
+            return
+        self._sheets_sig = sig
+        self.sync_inventory(False)
+
     def _auto_sync_inventory(self):
         try:
-            self.sync_inventory(False)
+            if time.time() - getattr(self, "_last_sheets_auto", 0) >= 300:
+                self._last_sheets_auto = time.time()
+                self._auto_sheets_if_changed()
         finally:
             if cloud_enabled():
                 threading.Thread(target=self._cloud_pull_bg, daemon=True).start()
@@ -7180,7 +7370,9 @@ class App(tk.Tk):
         self._alert_fill(t, new_rows)
         btns = ttk.Frame(fr)
         btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="📤 إرسال واتساب لمسؤول المشتريات", style="Success.TButton",
+        ttk.Button(btns, text="📄 إرسال PDF واتساب", style="Success.TButton",
+                   command=lambda: self.shortage_pdf([r["id"] for r in new_rows], parent=win, send_whatsapp=True)).pack(side="right", padx=4)
+        ttk.Button(btns, text="📤 إرسال واتساب (نص)",
                    command=lambda: self._send_shortage_whatsapp([r["id"] for r in new_rows], win)).pack(side="right", padx=4)
         ttk.Button(btns, text="عرض كل النواقص", command=lambda: (close(), self.alerts_window())).pack(side="right", padx=4)
         ttk.Button(btns, text="إغلاق", command=close).pack(side="left", padx=4)
@@ -7224,7 +7416,9 @@ class App(tk.Tk):
             self.clipboard_append(self.shortage_message(ids()))
             messagebox.showinfo("تم", "تم نسخ القائمة. الصقها في أي محادثة (Ctrl+V).", parent=win)
 
-        ttk.Button(bar, text="📤 إرسال واتساب لمسؤول المشتريات", style="Success.TButton",
+        ttk.Button(bar, text="📄 طلب النواقص PDF (واتساب)", style="Success.TButton",
+                   command=lambda: self.shortage_pdf(ids(), parent=win, send_whatsapp=True)).pack(side="right", padx=4)
+        ttk.Button(bar, text="📤 إرسال واتساب (نص)",
                    command=lambda: self._send_shortage_whatsapp(ids(), win)).pack(side="right", padx=4)
         ttk.Button(bar, text="📋 نسخ النص", command=copy_text).pack(side="right", padx=4)
         ttk.Button(bar, text="📝 طلب شراء من المورد", command=lambda: (win.destroy(), self.po_page())).pack(side="right", padx=4)
@@ -7465,6 +7659,169 @@ class App(tk.Tk):
         add("شكرًا 🙏")
         return "\n".join(out)
 
+    # ------------------------------------------------------------- طلب النواقص PDF
+    def _purchasing_phone(self, parent=None):
+        phone = normalize_phone(setting("purchasing_phone"))
+        if len(phone) < 9 and self.role != "admin":
+            messagebox.showwarning("تنبيه", "رقم مسؤول المشتريات يحدده المدير من الإعدادات. اطلب منه إضافته.", parent=parent or self)
+            return ""
+        if len(phone) < 9:
+            ph = simpledialog.askstring("مسؤول المشتريات", "رقم واتساب مسؤول المشتريات:", parent=parent or self) or ""
+            phone = normalize_phone(ph)
+            if len(phone) < 9:
+                messagebox.showwarning("تنبيه", "رقم الجوال غير صحيح", parent=parent or self)
+                return ""
+            setsetting("purchasing_phone", phone)
+        return phone
+
+    def shortage_report_html(self, item_ids, need=None, include_supplier=True):
+        """مستند HTML منسّق (A4) لطلب النواقص — يُحوَّل بعدها إلى PDF."""
+        need = need or {}
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return ""
+        with connect() as c:
+            marks = ",".join("?" * len(ids))
+            order = "COALESCE(NULLIF(supplier,''),'~'), item_no" if include_supplier else "item_no"
+            rows = c.execute(f"SELECT * FROM items WHERE id IN ({marks}) ORDER BY {order}", ids).fetchall()
+        officer = setting("purchasing_name")
+        officer_phone = setting("purchasing_phone")
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        heads = ["#", "رقم الصنف", "رقم القطعة", "الوصف", "المتوفر", "المطلوب"]
+        if include_supplier:
+            heads.append("رمز المنتج عند المورد")
+        body, current, idx, total_need = [], object(), 0, 0
+        for r in rows:
+            supplier = (r["supplier"] or "")
+            if include_supplier and supplier != current:
+                current = supplier
+                label = html.escape(supplier) if supplier else "بدون مورد محدد"
+                body.append(f'<tr class="sup"><td colspan="{len(heads)}">🏭 المورد: {label}</td></tr>')
+            idx += 1
+            wanted = need.get(str(r["id"]))
+            if wanted:
+                total_need += int(wanted)
+            desc = " — ".join(x for x in (r["category"], r["car"]) if x)
+            cells = [str(idx), str(r["item_no"] or ""), str(r["part"] or "-"), desc or "-",
+                     str(r["qty"] or 0), str(wanted or "")]
+            if include_supplier:
+                cells.append(str(r["rep_code"] or ""))
+            tds = []
+            for i, cell in enumerate(cells):
+                cls = ' class="d"' if i == 3 else ""
+                tds.append(f"<td{cls}>{html.escape(cell)}</td>")
+            body.append("<tr>" + "".join(tds) + "</tr>")
+        return (
+            '<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">'
+            '<title>طلب نواقص</title><style>'
+            '@page{size:A4;margin:12mm}'
+            '*{box-sizing:border-box}'
+            'body{font-family:"Segoe UI",Tahoma,Arial,sans-serif;color:#0f172a;margin:0;font-size:12px}'
+            '.head{display:flex;justify-content:space-between;align-items:center;'
+            'border-bottom:3px solid #2563eb;padding-bottom:8px}'
+            '.shop{font-size:21px;font-weight:700}'
+            '.sub{color:#64748b;font-size:11.5px;margin-top:3px}'
+            '.tag{background:#2563eb;color:#fff;padding:6px 14px;border-radius:8px;font-size:13px;font-weight:700}'
+            '.meta{width:100%;border-collapse:collapse;margin:10px 0 12px}'
+            '.meta td{border:1px solid #e2e8f0;padding:5px 8px}'
+            'table.it{width:100%;border-collapse:collapse}'
+            'table.it th{background:#0f172a;color:#fff;padding:6px 5px;border:1px solid #0f172a;'
+            'font-weight:600;font-size:11.5px}'
+            'table.it td{border:1px solid #cbd5e1;padding:5px;text-align:center}'
+            'table.it td.d{text-align:right}'
+            'tr.sup td{background:#e2e8f0;font-weight:700;text-align:right;padding:6px 8px}'
+            '.foot{display:flex;justify-content:space-between;margin-top:14px;color:#64748b;font-size:11px}'
+            '</style></head><body>'
+            '<div class="head"><div><div class="shop">🔑 العباد للمفاتيح</div>'
+            f'<div class="sub">طلب شراء — نواقص المخزون<br>تاريخ الطلب: {stamp}</div></div>'
+            '<div class="tag">طلب نواقص</div></div>'
+            '<table class="meta"><tr>'
+            f'<td><b>إلى:</b> {html.escape(officer) if officer else "مسؤول المشتريات"}</td>'
+            f'<td><b>واتساب:</b> {html.escape(str(officer_phone)) if officer_phone else "—"}</td>'
+            f'<td><b>عدد الأصناف:</b> {len(rows)}</td>'
+            f'<td><b>إجمالي المطلوب:</b> {total_need if total_need else "—"}</td>'
+            '</tr></table>'
+            '<table class="it"><thead><tr>' + "".join(f"<th>{h}</th>" for h in heads)
+            + '</tr></thead><tbody>' + "".join(body) + '</tbody></table>'
+            f'<div class="foot"><span>أُنشئ بواسطة: {html.escape(str(self.user or ""))}</span>'
+            f'<span>العباد للمفاتيح — {stamp}</span></div>'
+            '</body></html>'
+        )
+
+    def save_shortage_pdf(self, item_ids, need=None, include_supplier=True, parent=None):
+        """يحفظ طلب النواقص PDF ويرجع مسار الملف (أو None)."""
+        item_ids = list(item_ids)
+        if not item_ids:
+            messagebox.showwarning("تنبيه", "لا توجد أصناف لإرسالها", parent=parent or self)
+            return None
+        doc = self.shortage_report_html(item_ids, need or {}, include_supplier)
+        if not doc:
+            return None
+        folder = shortage_reports_dir()
+        fname = "طلب نواقص " + datetime.now().strftime("%Y-%m-%d %H-%M") + ".pdf"
+        path = os.path.join(folder, fname)
+        tmp_pdf = os.path.join(tempfile.gettempdir(),
+                               "shortage_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".pdf")
+        if html_to_pdf(doc, tmp_pdf):
+            try:
+                os.replace(tmp_pdf, path)
+            except Exception:
+                try:
+                    shutil.copyfile(tmp_pdf, path)
+                    os.remove(tmp_pdf)
+                except Exception:
+                    path = tmp_pdf
+            return path
+        # لا Edge ولا Chrome: نفتح المستند للطباعة أو الحفظ كـ PDF
+        self._shortage_print_fallback(doc, path, parent)
+        return None
+
+    def _shortage_print_fallback(self, doc, pdf_path, parent=None):
+        html_path = os.path.splitext(pdf_path)[0] + ".html"
+        try:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(doc.replace("</body></html>",
+                                    '<script>window.onload=()=>setTimeout(()=>window.print(),500)</script></body></html>'))
+        except Exception as e:
+            messagebox.showerror("خطأ", "تعذّر حفظ الملف: " + str(e), parent=parent or self)
+            return
+        try:
+            os.startfile(html_path)
+        except AttributeError:
+            webbrowser.open(Path(html_path).as_uri())
+        messagebox.showinfo("طلب النواقص",
+                            "ما لقيت Edge أو Chrome في الجهاز لعمل PDF تلقائيًا.\n"
+                            "فتحت لك الطلب في المتصفح: اختر الطابعة (Microsoft Print to PDF) ثم احفظ.\n\n"
+                            "الملف: " + html_path, parent=parent or self)
+
+    def shortage_pdf(self, item_ids, need=None, parent=None, send_whatsapp=False):
+        """طلب النواقص كملف PDF: حفظ + فتح الملف + (اختياريًا) فتح واتساب مسؤول المشتريات."""
+        item_ids = list(item_ids)
+        if not item_ids:
+            messagebox.showwarning("تنبيه", "لا توجد أصناف لإرسالها", parent=parent or self)
+            return
+        path = self.save_shortage_pdf(item_ids, need, include_supplier=self.can_see_supplier(), parent=parent)
+        if not path:
+            return
+        try:
+            os.startfile(path)
+        except AttributeError:
+            webbrowser.open(Path(path).as_uri())
+        if not send_whatsapp:
+            messagebox.showinfo("طلب النواقص PDF", "تم حفظ الطلب كملف PDF وفتحه.\n\n" + path,
+                                parent=parent or self)
+            return
+        phone = self._purchasing_phone(parent)
+        if not phone:
+            messagebox.showinfo("طلب النواقص PDF", "تم حفظ الملف وفتحه:\n" + path, parent=parent or self)
+            return
+        note = "طلب النواقص " + datetime.now().strftime("%Y-%m-%d") + " مرفق كملف PDF."
+        webbrowser.open("https://wa.me/" + phone + "?text=" + urllib.parse.quote(note))
+        messagebox.showinfo("طلب النواقص PDF",
+                            "الملف جاهز وفتحته لك.\n\n"
+                            "في واتساب: اضغط 📎 (إرفاق) → مستند → اختر الملف من مجلد (طلبات النواقص).\n\n"
+                            "الملف: " + path, parent=parent or self)
+
     def shortage_window(self, rep=None):
         if not self.can("shortage"):
             return
@@ -7587,9 +7944,17 @@ class App(tk.Tk):
             else:
                 webbrowser.open("https://wa.me/" + phone + "?text=" + enc)
 
+        def pdf_send():
+            self.shortage_pdf(current_ids(), need, parent=win, send_whatsapp=True)
+
+        def pdf_save():
+            self.shortage_pdf(current_ids(), need, parent=win, send_whatsapp=False)
+
         bar = ttk.Frame(body)
         bar.pack(fill="x", pady=6)
-        ttk.Button(bar, text="📤 إرسال واتساب لمسؤول المشتريات", style="Success.TButton", command=send).pack(side="right", padx=4)
+        ttk.Button(bar, text="📄 طلب النواقص PDF (واتساب)", style="Success.TButton", command=pdf_send).pack(side="right", padx=4)
+        ttk.Button(bar, text="🖨 حفظ / طباعة PDF", command=pdf_save).pack(side="right", padx=4)
+        ttk.Button(bar, text="📤 واتساب (نص)", command=send).pack(side="right", padx=4)
         ttk.Button(bar, text="📋 نسخ النص", command=copy_text).pack(side="right", padx=4)
         ttk.Button(bar, text="✎ تحديد الكمية المطلوبة", command=set_need).pack(side="right", padx=4)
         if self.role == "admin":
@@ -9290,6 +9655,13 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ السحابة
     def cloud_settings(self):
+        try:
+            import libsql  # noqa: F401
+        except Exception:
+            messagebox.showinfo("السحابة",
+                                "ميزة السحابة تحتاج مكتبة libsql، وهي غير مضمّنة في نسخة ويندوز 7.\n"
+                                "على ويندوز 7 يعمل البرنامج محليًا فقط، وللسحابة استخدم النسخة العادية على ويندوز 10/11.")
+            return
         url0, token0 = cloud_config()
         win = tk.Toplevel(self)
         win.title("السحابة — جهازان وقاعدة واحدة")
@@ -9313,6 +9685,12 @@ class App(tk.Tk):
         token = ttk.Entry(fr, width=78, show="•")
         token.pack(pady=3)
         token.insert(0, token0)
+
+        ttk.Label(fr, text="المزامنة مع السحابة بعد كل حفظ: كل كم ثانية؟ (0 = فورية، وكلما زاد الرقم صار البرنامج أسرع)",
+                  style="Muted.TLabel", justify="right").pack(anchor="e", pady=(8, 2))
+        gap_e = ttk.Entry(fr, width=10, justify="center")
+        gap_e.pack(anchor="e")
+        gap_e.insert(0, str(int(cloud_sync_gap())))
 
         status = ttk.Label(fr, text="", foreground=GREEN, justify="right")
         status.pack(anchor="e", pady=6)
@@ -9378,6 +9756,16 @@ class App(tk.Tk):
                 return
             bg_job(cloud_import_local, "تم رفع البيانات ومطابقة المجاميع")
 
+        def save_gap():
+            try:
+                v = max(0, int(float(gap_e.get() or 20)))
+            except Exception:
+                set_status("اكتب رقمًا صحيحًا للثواني", RED)
+                return
+            setsetting("cloud_sync_seconds", v)
+            CLOUD_SYNC_GAP["seconds"] = float(v)
+            set_status("تم الحفظ: " + ("مزامنة فورية بعد كل حفظ" if v == 0 else f"مزامنة كل {v} ثانية"))
+
         def sync_now():
             def work():
                 ok, msg = cloud_pull()
@@ -9404,6 +9792,7 @@ class App(tk.Tk):
         ttk.Button(row, text="حفظ وربط", style="Accent.TButton", command=save).pack(side="right", padx=4)
         ttk.Button(row, text="اختبار الاتصال", command=test).pack(side="right", padx=4)
         ttk.Button(row, text="مزامنة الآن", command=sync_now).pack(side="right", padx=4)
+        ttk.Button(row, text="حفظ سرعة المزامنة", command=save_gap).pack(side="right", padx=4)
         ttk.Button(row, text="فصل السحابة", style="Danger.TButton", command=disconnect).pack(side="left", padx=4)
         ttk.Button(row, text="رفع بيانات هذا الجهاز", command=upload).pack(side="left", padx=4)
         ttk.Button(row, text="إغلاق", command=win.destroy).pack(side="left", padx=4)
